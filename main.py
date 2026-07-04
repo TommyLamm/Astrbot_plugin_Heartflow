@@ -353,12 +353,12 @@ class HeartflowPlugin(star.Star):
 
                 # 优先尝试 structured output（仅 Google provider 支持）
                 if self._is_google_provider(provider):
+                    # Google provider: 只走 structured output，失败直接 fallback 到下一个 provider
                     judge_data = await self._judge_with_structured_output(
                         provider, judge_prompt
                     )
-
-                # structured output 不可用或失败时，fallback 到 text_chat
-                if judge_data is None:
+                else:
+                    # 非 Google provider: 走 text_chat
                     judge_data = await self._judge_with_text_chat(
                         provider, judge_prompt, persona_system_prompt
                     )
@@ -430,6 +430,7 @@ class HeartflowPlugin(star.Star):
         """使用 Google GenAI 原生结构化输出进行判断。
 
         返回解析后的 dict，或在失败时返回 None。
+        底层 AstrBot 会自动重试 HTTP 错误（最多5次），此处失败即放弃该 provider。
         """
         try:
             from google.genai import types
@@ -457,13 +458,14 @@ class HeartflowPlugin(star.Star):
             return judge_data
 
         except Exception as e:
-            logger.warning(f"Google GenAI 结构化输出失败，将 fallback 到 text_chat: {e}")
+            logger.warning(f"Google GenAI 结构化输出失败: {e}")
             return None
 
     async def _judge_with_text_chat(self, judge_provider, judge_prompt: str, persona_system_prompt: str) -> dict | None:
-        """使用 text_chat fallback 进行判断（适用于非 Google 提供商）。
+        """使用 text_chat 进行判断（适用于非 Google 提供商）。
 
-        返回解析后的 dict，或在全部重试失败后返回 None。
+        返回解析后的 dict，或在失败时返回 None。
+        底层 AstrBot 会自动重试 HTTP 错误（最多5次），此处失败即放弃该 provider。
         """
         # 构建完整的判断提示词
         complete_judge_prompt = "你是一个专业的群聊回复决策系统，能够准确判断消息价值和回复时机。"
@@ -475,35 +477,21 @@ class HeartflowPlugin(star.Star):
 {"relevance": 分数, "willingness": 分数, "social": 分数, "timing": 分数, "continuity": 分数, "reasoning": "详细分析原因"}
 """
 
-        max_retries = self.judge_max_retries + 1
-        if self.judge_max_retries == 0:
-            max_retries = 1
+        try:
+            llm_response = await judge_provider.text_chat(
+                prompt=complete_judge_prompt,
+                contexts=[],  # 不传对话历史，防止角色扮演污染
+                image_urls=[],
+            )
 
-        for attempt in range(max_retries):
-            try:
-                llm_response = await judge_provider.text_chat(
-                    prompt=complete_judge_prompt,
-                    contexts=[],  # 不传对话历史，防止角色扮演污染
-                    image_urls=[],
-                )
+            content = llm_response.completion_text.strip()
+            logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
 
-                content = llm_response.completion_text.strip()
-                logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
+            return _extract_json(content)
 
-                judge_data = _extract_json(content)
-                return judge_data
-
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(f"小参数模型返回JSON解析失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
-                if attempt < max_retries - 1:
-                    # 还有重试机会，添加更强的提示
-                    complete_judge_prompt = complete_judge_prompt.replace(
-                        "**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！**",
-                        f"**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！这是第{attempt + 2}次尝试，请确保返回有效的JSON格式！**"
-                    )
-
-        logger.error(f"小参数模型重试{self.judge_max_retries}次后仍然返回无效JSON")
-        return None
+        except Exception as e:
+            logger.warning(f"text_chat 调用失败: {e}")
+            return None
 
     def _record_raw_message(self, event: AstrMessageEvent, is_bot: bool = False) -> None:
         """将消息写入原始消息缓冲区"""
@@ -788,7 +776,7 @@ class HeartflowPlugin(star.Star):
 ⚙️ **配置参数**
 - 回复阈值: {self.reply_threshold}
 - 判断提供商链: {' -> '.join(self.judge_provider_chain) if self.judge_provider_chain else '(未配置)'}
-- 最大重试次数: {self.judge_max_retries}
+- 最大重试次数: {self.judge_max_retries} (注: HTTP 重试由底层统一处理5次)
 - 白名单模式: {'✅ 开启' if self.whitelist_enabled else '❌ 关闭'}
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
 
