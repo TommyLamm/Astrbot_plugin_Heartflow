@@ -117,7 +117,7 @@
     "description": "判断失败最大重试次数",
     "type": "int",
     "default": 3,
-    "hint": "当小模型返回无效JSON时的最大重试次数，设为0时不重试，建议1-5次"
+    "hint": "单个 provider 调用失败时的重试次数（含 structured output 和 text_chat）。设为0或1表示不重试。建议1-5次"
   },
   "judge_context_count": {
     "description": "传入判断模型的上下文条数",

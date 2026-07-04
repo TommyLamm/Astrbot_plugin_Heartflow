@@ -335,36 +335,47 @@ class HeartflowPlugin(star.Star):
         """使用 Google GenAI 原生结构化输出进行判断。
 
         返回解析后的 dict，或在失败时返回 None。
-        底层 AstrBot 会自动重试 HTTP 错误（最多5次），此处失败即放弃该 provider。
+        直接调用底层 genai client，绕过 AstrBot 重试层，故此处自行重试。
         """
-        try:
-            from google.genai import types
+        from google.genai import types
 
-            client = judge_provider.client
-            model = judge_provider.model_name
+        client = judge_provider.client
+        model = judge_provider.model_name
 
-            # AsyncClient 直接调用；sync Client 需要通过 .aio 访问
-            if hasattr(client, 'aio'):
-                gen = client.aio.models.generate_content
-            else:
-                gen = client.models.generate_content
+        # AsyncClient 直接调用；sync Client 需要通过 .aio 访问
+        if hasattr(client, 'aio'):
+            gen = client.aio.models.generate_content
+        else:
+            gen = client.models.generate_content
 
-            response = await gen(
-                model=model,
-                contents=judge_prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=JUDGE_JSON_SCHEMA,
-                ),
-            )
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=JUDGE_JSON_SCHEMA,
+        )
 
-            judge_data = json.loads(response.text)
-            logger.debug(f"结构化输出成功: {judge_data}")
-            return judge_data
+        max_retries = max(1, self.judge_max_retries)
+        last_err = None
 
-        except Exception as e:
-            logger.warning(f"Google GenAI 结构化输出失败: {e}")
-            return None
+        for attempt in range(max_retries):
+            try:
+                response = await gen(
+                    model=model,
+                    contents=judge_prompt,
+                    config=config,
+                )
+                judge_data = json.loads(response.text)
+                if attempt > 0:
+                    logger.info(f"结构化输出在第 {attempt + 1} 次尝试成功: {judge_data}")
+                else:
+                    logger.debug(f"结构化输出成功: {judge_data}")
+                return judge_data
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries - 1:
+                    logger.warning(f"结构化输出失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                else:
+                    logger.warning(f"结构化输出重试 {max_retries} 次后仍失败: {e}")
+        return None
 
     async def _judge_with_text_chat(self, judge_provider, judge_prompt: str, persona_system_prompt: str) -> dict | None:
         """使用 text_chat 进行判断（适用于非 Google 提供商）。
@@ -382,21 +393,34 @@ class HeartflowPlugin(star.Star):
 {"relevance": 分数, "willingness": 分数, "social": 分数, "timing": 分数, "continuity": 分数, "reasoning": "详细分析原因"}
 """
 
-        try:
-            llm_response = await judge_provider.text_chat(
-                prompt=complete_judge_prompt,
-                contexts=[],  # 不传对话历史，防止角色扮演污染
-                image_urls=[],
-            )
+        max_retries = max(1, self.judge_max_retries)
+        last_err = None
 
-            content = llm_response.completion_text.strip()
-            logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
+        for attempt in range(max_retries):
+            try:
+                llm_response = await judge_provider.text_chat(
+                    prompt=complete_judge_prompt,
+                    contexts=[],  # 不传对话历史，防止角色扮演污染
+                    image_urls=[],
+                )
 
-            return _extract_json(content)
+                content = llm_response.completion_text.strip()
+                logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
 
-        except Exception as e:
-            logger.warning(f"text_chat 调用失败: {e}")
-            return None
+                return _extract_json(content)
+
+            except (json.JSONDecodeError, ValueError) as e:
+                # HTTP 成功但返回非 JSON，底层不会重试，由上层重试
+                last_err = e
+                if attempt < max_retries - 1:
+                    logger.warning(f"text_chat JSON 解析失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                else:
+                    logger.warning(f"text_chat JSON 解析重试 {max_retries} 次后仍失败: {e}")
+            except Exception as e:
+                # HTTP 错误底层已重试过，直接放弃
+                logger.warning(f"text_chat 调用失败: {e}")
+                return None
+        return None
 
     def _record_raw_message(self, event: AstrMessageEvent, is_bot: bool = False) -> None:
         """将消息写入原始消息缓冲区"""
@@ -681,7 +705,7 @@ class HeartflowPlugin(star.Star):
 ⚙️ **配置参数**
 - 回复阈值: {self.reply_threshold}
 - 判断提供商链: {' -> '.join(self.judge_provider_chain) if self.judge_provider_chain else '(未配置)'}
-- 最大重试次数: {self.judge_max_retries} (注: HTTP 重试由底层统一处理5次)
+- 最大重试次数: {self.judge_max_retries}
 - 白名单模式: {'✅ 开启' if self.whitelist_enabled else '❌ 关闭'}
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
 
