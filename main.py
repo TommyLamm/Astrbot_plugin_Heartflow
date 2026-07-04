@@ -91,6 +91,21 @@ def _clamp_score(v) -> float:
         return 0.0
 
 
+# Gemini/Google GenAI 结构化输出 Schema
+# 不包含 reasoning 字段：小模型生成长文本 string 会出现重复退化
+JUDGE_JSON_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "relevance": {"type": "INTEGER", "description": "内容相关度(0-10)"},
+        "willingness": {"type": "INTEGER", "description": "回复意愿(0-10)"},
+        "social": {"type": "INTEGER", "description": "社交适宜性(0-10)"},
+        "timing": {"type": "INTEGER", "description": "时机恰当性(0-10)"},
+        "continuity": {"type": "INTEGER", "description": "对话连贯性(0-10)"},
+    },
+    "required": ["relevance", "willingness", "social", "timing", "continuity"],
+}
+
+
 class HeartflowPlugin(star.Star):
 
     def __init__(self, context: star.Context, config):
@@ -122,7 +137,6 @@ class HeartflowPlugin(star.Star):
         self.system_prompt_cache: Dict[str, Dict[str, str]] = {}
 
         # 判断配置
-        self.judge_include_reasoning = self.config.get("judge_include_reasoning", True)
         self.judge_max_retries = max(0, self.config.get("judge_max_retries", 3))  # 确保最小为0
         
         # 判断权重配置
@@ -189,7 +203,7 @@ class HeartflowPlugin(star.Star):
             return original_prompt
     
     async def _summarize_system_prompt(self, original_prompt: str) -> str:
-        """使用小模型对系统提示词进行总结"""
+        """使用小模型对系统提示词进行总结（纯文本，不要求 JSON）"""
         try:
             if not self.judge_provider_name:
                 return original_prompt
@@ -200,16 +214,10 @@ class HeartflowPlugin(star.Star):
             
             summarize_prompt = f"""请将以下机器人角色设定总结为简洁的核心要点，保留关键的性格特征、行为方式和角色定位。
 总结后的内容应该在100-200字以内，突出最重要的角色特点。
+直接输出总结后的角色设定文本，不要包含任何前缀、标题或格式标记。
 
 原始角色设定：
-{original_prompt}
-
-请以JSON格式回复：
-{{
-    "summarized_persona": "精简后的角色设定，保留核心特征和行为方式"
-}}
-
-**重要：你的回复必须是完整的JSON对象，不要包含任何其他内容！**"""
+{original_prompt}"""
 
             llm_response = await judge_provider.text_chat(
                 prompt=summarize_prompt,
@@ -218,19 +226,10 @@ class HeartflowPlugin(star.Star):
 
             content = llm_response.completion_text.strip()
             
-            # 尝试提取JSON
-            try:
-                result_data = _extract_json(content)
-                summarized = result_data.get("summarized_persona", "")
-
-                if summarized and len(summarized.strip()) > 10:
-                    return summarized.strip()
-                else:
-                    logger.warning("小模型返回的总结内容为空或过短")
-                    return original_prompt
-
-            except (json.JSONDecodeError, ValueError):
-                logger.error(f"小模型总结系统提示词返回非有效JSON: {content}")
+            if content and len(content) > 10:
+                return content
+            else:
+                logger.warning("小模型返回的总结内容为空或过短")
                 return original_prompt
                 
         except Exception as e:
@@ -269,10 +268,6 @@ class HeartflowPlugin(star.Star):
         chat_context = self._build_chat_context(event)
         recent_messages = self._get_recent_messages(event)
         last_bot_reply = self._get_last_bot_reply(event)
-
-        reasoning_part = ""
-        if self.judge_include_reasoning:
-            reasoning_part = ',\n    "reasoning": "详细分析原因，说明为什么应该或不应该回复，需要结合机器人角色特点进行分析，特别说明与上次回复的关联性"'
 
         judge_prompt = f"""
 你是群聊机器人的决策系统，需要判断是否应该主动回复以下消息。
@@ -326,103 +321,145 @@ class HeartflowPlugin(star.Star):
    - 如果没有上次回复记录，给默认分数5分
 
 **回复阈值**: {self.reply_threshold} (综合评分达到此分数才回复)
-
-**重要！！！请严格按照以下JSON格式回复，不要添加任何其他内容：**
-
-请以JSON格式回复：
-{{
-    "relevance": 分数,
-    "willingness": 分数,
-    "social": 分数,
-    "timing": 分数,
-    "continuity": 分数{reasoning_part}
-}}
-
-**注意：你的回复必须是完整的JSON对象，不要包含任何解释性文字或其他内容！**
 """
 
         try:
-            # 构建完整的判断提示词，将系统提示直接整合到prompt中
-            complete_judge_prompt = "你是一个专业的群聊回复决策系统，能够准确判断消息价值和回复时机。"
-            if persona_system_prompt:
-                complete_judge_prompt += f"\n\n你正在为以下角色的机器人做决策：\n{persona_system_prompt}"
-            complete_judge_prompt += "\n\n**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！**\n\n"
-            complete_judge_prompt += judge_prompt
+            # 尝试使用 Google GenAI 原生结构化输出
+            judge_data = None
+            if self._is_google_provider(judge_provider):
+                judge_data = await self._judge_with_structured_output(
+                    judge_provider, judge_prompt
+                )
 
-            # 提前计算对话历史上下文（循环外只算一次）
-            recent_contexts = self._get_recent_contexts(event)
+            # 如果结构化输出不可用或失败，fallback 到 text_chat
+            if judge_data is None:
+                judge_data = await self._judge_with_text_chat(
+                    judge_provider, judge_prompt, persona_system_prompt
+                )
 
-            # 重试机制：使用配置的重试次数
-            max_retries = self.judge_max_retries + 1
-            if self.judge_max_retries == 0:
-                max_retries = 1
+            # 如果全部失败，返回保守默认分数
+            if judge_data is None:
+                logger.warning("所有判断方式均失败，返回保守默认分数")
+                return JudgeResult(
+                    relevance=5.0, willingness=5.0, social=5.0,
+                    timing=5.0, continuity=5.0, reasoning="所有判断方式均失败，使用默认分数",
+                    should_reply=False, confidence=0.5, overall_score=0.5,
+                )
 
-            for attempt in range(max_retries):
-                try:
-                    llm_response = await judge_provider.text_chat(
-                        prompt=complete_judge_prompt,
-                        contexts=recent_contexts,
-                        image_urls=[],
-                    )
+            # 从 judge_data 提取分数并钉位到 [0, 10]
+            relevance = _clamp_score(judge_data.get("relevance", 0))
+            willingness = _clamp_score(judge_data.get("willingness", 0))
+            social = _clamp_score(judge_data.get("social", 0))
+            timing = _clamp_score(judge_data.get("timing", 0))
+            continuity = _clamp_score(judge_data.get("continuity", 0))
 
-                    content = llm_response.completion_text.strip()
-                    logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
+            # 计算综合评分
+            overall_score = (
+                relevance * self.weights["relevance"] +
+                willingness * self.weights["willingness"] +
+                social * self.weights["social"] +
+                timing * self.weights["timing"] +
+                continuity * self.weights["continuity"]
+            ) / 10.0
 
-                    judge_data = _extract_json(content)
+            should_reply = overall_score >= self.reply_threshold
 
-                    # 直接从 JSON 根对象获取分数，并钉位到 [0, 10]
-                    relevance = _clamp_score(judge_data.get("relevance", 0))
-                    willingness = _clamp_score(judge_data.get("willingness", 0))
-                    social = _clamp_score(judge_data.get("social", 0))
-                    timing = _clamp_score(judge_data.get("timing", 0))
-                    continuity = _clamp_score(judge_data.get("continuity", 0))
-                    
-                    # 计算综合评分
-                    overall_score = (
-                        relevance * self.weights["relevance"] +
-                        willingness * self.weights["willingness"] +
-                        social * self.weights["social"] +
-                        timing * self.weights["timing"] +
-                        continuity * self.weights["continuity"]
-                    ) / 10.0
+            logger.debug(f"小参数模型判断成功，综合评分: {overall_score:.3f}, 是否回复: {should_reply}")
 
-                    # 根据综合评分判断是否应该回复
-                    should_reply = overall_score >= self.reply_threshold
-
-                    logger.debug(f"小参数模型判断成功，综合评分: {overall_score:.3f}, 是否回复: {should_reply}")
-
-                    return JudgeResult(
-                        relevance=relevance,
-                        willingness=willingness,
-                        social=social,
-                        timing=timing,
-                        continuity=continuity,
-                        reasoning=judge_data.get("reasoning", "") if self.judge_include_reasoning else "",
-                        should_reply=should_reply,
-                        confidence=overall_score,  # 使用综合评分作为置信度
-                        overall_score=overall_score,
-                        related_messages=[]  # 不再使用关联消息功能
-                    )
-                    
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.warning(f"小参数模型返回JSON解析失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
-                    logger.warning(f"无法解析的内容: {content[:500]}...")
-                    
-                    if attempt == max_retries - 1:
-                        # 最后一次尝试失败，返回失败结果
-                        logger.error(f"小参数模型重试{self.judge_max_retries}次后仍然返回无效JSON，放弃处理")
-                        return JudgeResult(should_reply=False, reasoning=f"JSON解析失败，重试{self.judge_max_retries}次")
-                    else:
-                        # 还有重试机会，添加更强的提示
-                        complete_judge_prompt = complete_judge_prompt.replace(
-                            "**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！**",
-                            f"**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！这是第{attempt + 2}次尝试，请确保返回有效的JSON格式！**"
-                        )
-                        continue
+            return JudgeResult(
+                relevance=relevance, willingness=willingness,
+                social=social, timing=timing, continuity=continuity,
+                reasoning="",
+                should_reply=should_reply,
+                confidence=overall_score,
+                overall_score=overall_score,
+                related_messages=[],
+            )
 
         except Exception as e:
             logger.error(f"小参数模型判断异常: {e}")
             return JudgeResult(should_reply=False, reasoning=f"异常: {str(e)}")
+
+    def _is_google_provider(self, provider) -> bool:
+        """检测 provider 是否为 Google GenAI（支持 structured output）"""
+        try:
+            if not hasattr(provider, 'client'):
+                return False
+            client = provider.client
+            module = type(client).__module__ or ""
+            return "google" in module and "genai" in module
+        except Exception:
+            return False
+
+    async def _judge_with_structured_output(self, judge_provider, judge_prompt: str) -> dict | None:
+        """使用 Google GenAI 原生结构化输出进行判断。
+
+        返回解析后的 dict，或在失败时返回 None。
+        """
+        try:
+            from google.genai import types
+
+            response = await judge_provider.client.aio.models.generate_content(
+                model=judge_provider.model_name,
+                contents=judge_prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=JUDGE_JSON_SCHEMA,
+                ),
+            )
+
+            judge_data = json.loads(response.text)
+            logger.debug(f"结构化输出成功: {judge_data}")
+            return judge_data
+
+        except Exception as e:
+            logger.warning(f"Google GenAI 结构化输出失败，将 fallback 到 text_chat: {e}")
+            return None
+
+    async def _judge_with_text_chat(self, judge_provider, judge_prompt: str, persona_system_prompt: str) -> dict | None:
+        """使用 text_chat fallback 进行判断（适用于非 Google 提供商）。
+
+        返回解析后的 dict，或在全部重试失败后返回 None。
+        """
+        # 构建完整的判断提示词
+        complete_judge_prompt = "你是一个专业的群聊回复决策系统，能够准确判断消息价值和回复时机。"
+        if persona_system_prompt:
+            complete_judge_prompt += f"\n\n你正在为以下角色的机器人做决策：\n{persona_system_prompt}"
+        complete_judge_prompt += "\n\n**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！**\n\n"
+        complete_judge_prompt += judge_prompt
+        complete_judge_prompt += """\n\n请严格按以下JSON格式回复，不要添加任何其他内容：
+{"relevance": 分数, "willingness": 分数, "social": 分数, "timing": 分数, "continuity": 分数}
+"""
+
+        max_retries = self.judge_max_retries + 1
+        if self.judge_max_retries == 0:
+            max_retries = 1
+
+        for attempt in range(max_retries):
+            try:
+                llm_response = await judge_provider.text_chat(
+                    prompt=complete_judge_prompt,
+                    contexts=[],  # 不传对话历史，防止角色扮演污染
+                    image_urls=[],
+                )
+
+                content = llm_response.completion_text.strip()
+                logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
+
+                judge_data = _extract_json(content)
+                return judge_data
+
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"小参数模型返回JSON解析失败 (尝试 {attempt + 1}/{max_retries}): {str(e)}")
+                if attempt < max_retries - 1:
+                    # 还有重试机会，添加更强的提示
+                    complete_judge_prompt = complete_judge_prompt.replace(
+                        "**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！**",
+                        f"**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！这是第{attempt + 2}次尝试，请确保返回有效的JSON格式！**"
+                    )
+
+        logger.error(f"小参数模型重试{self.judge_max_retries}次后仍然返回无效JSON")
+        return None
 
     def _record_raw_message(self, event: AstrMessageEvent, is_bot: bool = False) -> None:
         """将消息写入原始消息缓冲区"""
@@ -466,13 +503,13 @@ class HeartflowPlugin(star.Star):
 
                 # 更新主动回复状态
                 self._update_active_state(event, judge_result)
-                logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
+                logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f}")
                 
                 # 不需要yield任何内容，让核心系统处理
                 return
             else:
                 # 记录被动状态
-                logger.debug(f"心流判断不通过 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | 原因: {judge_result.reasoning[:30]}...")
+                logger.debug(f"心流判断不通过 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f}")
                 self._update_passive_state(event, judge_result)
 
         except Exception as e:
@@ -591,24 +628,6 @@ class HeartflowPlugin(star.Star):
 
         return int((time.time() - chat_state.last_reply_time) / 60)
 
-    def _get_recent_contexts(self, event: AstrMessageEvent) -> list:
-        """从原始消息缓冲区获取最近对话上下文（用于传递给小参数模型）。
-
-        使用本地缓冲区而非 conversation_manager，以便包含所有群聊消息，
-        而不仅仅是触发过 LLM 的消息。
-        """
-        msgs = self._get_raw_buffer(event.unified_msg_origin)
-        # 排除当前这条消息（已被 _record_raw_message 写入），取之前的若干条
-        if msgs and msgs[-1].content == event.message_str:
-            msgs = msgs[:-1]
-        recent = msgs[-self.context_messages_count:] if len(msgs) > self.context_messages_count else msgs
-
-        contexts = []
-        for m in recent:
-            role = "assistant" if m.is_bot else "user"
-            contexts.append({"role": role, "content": m.content})
-        return contexts
-
     def _get_recent_messages(self, event: AstrMessageEvent) -> str:
         """从原始消息缓冲区获取最近的消息历史（用于小参数模型判断）。
 
@@ -699,7 +718,7 @@ class HeartflowPlugin(star.Star):
         # 精力恢复（不回复时精力缓慢恢复）
         chat_state.energy = min(1.0, chat_state.energy + self.energy_recovery_rate)
 
-        logger.debug(f"更新被动状态: {chat_id[:20]}... | 精力: {chat_state.energy:.2f} | 原因: {judge_result.reasoning[:30]}...")
+        logger.debug(f"更新被动状态: {chat_id[:20]}... | 精力: {chat_state.energy:.2f}")
 
     # 管理员命令：查看心流状态
     @filter.command("heartflow")

@@ -78,12 +78,6 @@
     "default": 0.2,
     "hint": "针对判断权重的对话连贯性设置，默认20%"
   },
-  "judge_include_reasoning": {
-    "description": "判断时是否包含理由",
-    "type": "bool",
-    "default": true,
-    "hint": "让小模型在判断时返回详细理由。关闭可轻微提升性能和鲁棒性。"
-  },
   "judge_max_retries": {
     "description": "判断失败最大重试次数",
     "type": "int",
