@@ -9,7 +9,42 @@
     "description": "判断模型提供商",
     "type": "string",
     "default": "",
-    "hint": "用于小参数模型判断的提供商，建议使用Gemini 2.0 Flash等快速小模型",
+    "hint": "主判断模型提供商，建议使用Gemini 2.0 Flash等快速小模型",
+    "_special": "select_provider"
+  },
+  "judge_provider_fallback_1": {
+    "description": "备用判断模型1",
+    "type": "string",
+    "default": "",
+    "hint": "主模型调用失败时尝试的备用提供商，留空表示不启用",
+    "_special": "select_provider"
+  },
+  "judge_provider_fallback_2": {
+    "description": "备用判断模型2",
+    "type": "string",
+    "default": "",
+    "hint": "备用模型1也失败时尝试的第二个备用提供商，留空表示不启用",
+    "_special": "select_provider"
+  },
+  "judge_provider_fallback_3": {
+    "description": "备用判断模型3",
+    "type": "string",
+    "default": "",
+    "hint": "备用模型2也失败时尝试的第三个备用提供商，留空表示不启用",
+    "_special": "select_provider"
+  },
+  "judge_provider_fallback_4": {
+    "description": "备用判断模型4",
+    "type": "string",
+    "default": "",
+    "hint": "备用模型3也失败时尝试的第四个备用提供商，留空表示不启用",
+    "_special": "select_provider"
+  },
+  "judge_provider_fallback_5": {
+    "description": "备用判断模型5",
+    "type": "string",
+    "default": "",
+    "hint": "备用模型4也失败时尝试的第五个备用提供商，留空表示不启用",
     "_special": "select_provider"
   },
   "reply_threshold": {

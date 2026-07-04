@@ -92,7 +92,6 @@ def _clamp_score(v) -> float:
 
 
 # Gemini/Google GenAI 结构化输出 Schema
-# 不包含 reasoning 字段：小模型生成长文本 string 会出现重复退化
 JUDGE_JSON_SCHEMA = {
     "type": "OBJECT",
     "properties": {
@@ -101,8 +100,11 @@ JUDGE_JSON_SCHEMA = {
         "social": {"type": "INTEGER", "description": "社交适宜性(0-10)"},
         "timing": {"type": "INTEGER", "description": "时机恰当性(0-10)"},
         "continuity": {"type": "INTEGER", "description": "对话连贯性(0-10)"},
+        "reasoning": {"type": "STRING", "description": "详细分析原因"},
     },
-    "required": ["relevance", "willingness", "social", "timing", "continuity"],
+    "required": [
+        "relevance", "willingness", "social", "timing", "continuity", "reasoning"
+    ],
 }
 
 
@@ -112,8 +114,23 @@ class HeartflowPlugin(star.Star):
         super().__init__(context)
         self.config = config
 
-        # 判断模型配置
+        # 判断模型配置（带 fallback 链）
         self.judge_provider_name = self.config.get("judge_provider_name", "")
+        fallback_names = [
+            self.config.get(f"judge_provider_fallback_{i}", "")
+            for i in range(1, 6)
+        ]
+        # 有序 provider 名称列表，过滤空值和重复
+        seen = set()
+        self.judge_provider_chain = []
+        for name in [self.judge_provider_name] + fallback_names:
+            if name and name not in seen:
+                seen.add(name)
+                self.judge_provider_chain.append(name)
+        if not self.judge_provider_chain:
+            logger.warning("心流插件未配置任何判断模型提供商")
+        else:
+            logger.info(f"心流判断模型 fallback 链: {' -> '.join(self.judge_provider_chain)}")
 
         # 心流参数配置
         self.reply_threshold = self.config.get("reply_threshold", 0.6)
@@ -203,55 +220,54 @@ class HeartflowPlugin(star.Star):
             return original_prompt
     
     async def _summarize_system_prompt(self, original_prompt: str) -> str:
-        """使用小模型对系统提示词进行总结（纯文本，不要求 JSON）"""
-        try:
-            if not self.judge_provider_name:
-                return original_prompt
-            
-            judge_provider = self.context.get_provider_by_id(self.judge_provider_name)
-            if not judge_provider:
-                return original_prompt
-            
-            summarize_prompt = f"""请将以下机器人角色设定总结为简洁的核心要点，保留关键的性格特征、行为方式和角色定位。
+        """使用小模型对系统提示词进行总结（纯文本，不要求 JSON）。
+        
+        遍历 fallback 链直到有 provider 成功返回。
+        """
+        if not self.judge_provider_chain:
+            return original_prompt
+
+        summarize_prompt = f"""请将以下机器人角色设定总结为简洁的核心要点，保留关键的性格特征、行为方式和角色定位。
 总结后的内容应该在100-200字以内，突出最重要的角色特点。
 直接输出总结后的角色设定文本，不要包含任何前缀、标题或格式标记。
 
 原始角色设定：
 {original_prompt}"""
 
-            llm_response = await judge_provider.text_chat(
-                prompt=summarize_prompt,
-                contexts=[]  # 不需要上下文
-            )
+        last_err = None
+        for idx, provider_name in enumerate(self.judge_provider_chain):
+            try:
+                provider = self.context.get_provider_by_id(provider_name)
+                if not provider:
+                    logger.debug(f"[summarize] provider 不存在: {provider_name}")
+                    continue
 
-            content = llm_response.completion_text.strip()
-            
-            if content and len(content) > 10:
-                return content
-            else:
-                logger.warning("小模型返回的总结内容为空或过短")
-                return original_prompt
-                
-        except Exception as e:
-            logger.error(f"总结系统提示词异常: {e}")
-            return original_prompt
+                llm_response = await provider.text_chat(
+                    prompt=summarize_prompt,
+                    contexts=[],  # 不需要上下文
+                )
+                content = (llm_response.completion_text or "").strip()
+
+                if content and len(content) > 10:
+                    if idx > 0:
+                        logger.info(f"[summarize] 主 provider 失败，由备用 provider 成功: {provider_name}")
+                    return content
+                else:
+                    logger.warning(f"[summarize] provider {provider_name} 返回空或过短，尝试下一个")
+            except Exception as e:
+                last_err = e
+                logger.warning(f"[summarize] provider {provider_name} 调用失败: {e}，尝试下一个")
+                continue
+
+        logger.error(f"[summarize] 所有 provider 均失败: {last_err}")
+        return original_prompt
 
     async def judge_with_tiny_model(self, event: AstrMessageEvent) -> JudgeResult:
-        """使用小模型进行智能判断"""
+        """使用小模型进行智能判断（支持多 provider fallback）"""
 
-        if not self.judge_provider_name:
+        if not self.judge_provider_chain:
             logger.warning("小参数判断模型提供商名称未配置，跳过心流判断")
             return JudgeResult(should_reply=False, reasoning="提供商未配置")
-
-        # 获取指定的 provider
-        try:
-            judge_provider = self.context.get_provider_by_id(self.judge_provider_name)
-            if not judge_provider:
-                logger.warning(f"未找到提供商: {self.judge_provider_name}")
-                return JudgeResult(should_reply=False, reasoning=f"提供商不存在: {self.judge_provider_name}")
-        except Exception as e:
-            logger.error(f"获取提供商失败: {e}")
-            return JudgeResult(should_reply=False, reasoning=f"获取提供商失败: {str(e)}")
 
         # 获取群聊状态
         chat_state = self._get_chat_state(event.unified_msg_origin)
@@ -323,62 +339,81 @@ class HeartflowPlugin(star.Star):
 **回复阈值**: {self.reply_threshold} (综合评分达到此分数才回复)
 """
 
-        try:
-            # 尝试使用 Google GenAI 原生结构化输出
-            judge_data = None
-            if self._is_google_provider(judge_provider):
-                judge_data = await self._judge_with_structured_output(
-                    judge_provider, judge_prompt
-                )
+        # 遍历 fallback 链，依次尝试每个 provider
+        judge_data = None
+        used_provider_name = None
+        last_error = None
 
-            # 如果结构化输出不可用或失败，fallback 到 text_chat
-            if judge_data is None:
-                judge_data = await self._judge_with_text_chat(
-                    judge_provider, judge_prompt, persona_system_prompt
-                )
+        for provider_name in self.judge_provider_chain:
+            try:
+                provider = self.context.get_provider_by_id(provider_name)
+                if not provider:
+                    logger.warning(f"未找到提供商: {provider_name}，尝试下一个")
+                    continue
 
-            # 如果全部失败，返回保守默认分数
-            if judge_data is None:
-                logger.warning("所有判断方式均失败，返回保守默认分数")
-                return JudgeResult(
-                    relevance=5.0, willingness=5.0, social=5.0,
-                    timing=5.0, continuity=5.0, reasoning="所有判断方式均失败，使用默认分数",
-                    should_reply=False, confidence=0.5, overall_score=0.5,
-                )
+                # 优先尝试 structured output（仅 Google provider 支持）
+                if self._is_google_provider(provider):
+                    judge_data = await self._judge_with_structured_output(
+                        provider, judge_prompt
+                    )
 
-            # 从 judge_data 提取分数并钉位到 [0, 10]
-            relevance = _clamp_score(judge_data.get("relevance", 0))
-            willingness = _clamp_score(judge_data.get("willingness", 0))
-            social = _clamp_score(judge_data.get("social", 0))
-            timing = _clamp_score(judge_data.get("timing", 0))
-            continuity = _clamp_score(judge_data.get("continuity", 0))
+                # structured output 不可用或失败时，fallback 到 text_chat
+                if judge_data is None:
+                    judge_data = await self._judge_with_text_chat(
+                        provider, judge_prompt, persona_system_prompt
+                    )
 
-            # 计算综合评分
-            overall_score = (
-                relevance * self.weights["relevance"] +
-                willingness * self.weights["willingness"] +
-                social * self.weights["social"] +
-                timing * self.weights["timing"] +
-                continuity * self.weights["continuity"]
-            ) / 10.0
+                if judge_data is not None:
+                    used_provider_name = provider_name
+                    break
 
-            should_reply = overall_score >= self.reply_threshold
+            except Exception as e:
+                last_error = e
+                logger.warning(f"provider {provider_name} 判断失败: {e}，尝试下一个")
+                continue
 
-            logger.debug(f"小参数模型判断成功，综合评分: {overall_score:.3f}, 是否回复: {should_reply}")
-
+        # 所有 provider 都失败，返回保守默认分数
+        if judge_data is None:
+            logger.warning(f"所有判断方式均失败 (last_error={last_error})，返回保守默认分数")
             return JudgeResult(
-                relevance=relevance, willingness=willingness,
-                social=social, timing=timing, continuity=continuity,
-                reasoning="",
-                should_reply=should_reply,
-                confidence=overall_score,
-                overall_score=overall_score,
-                related_messages=[],
+                relevance=5.0, willingness=5.0, social=5.0,
+                timing=5.0, continuity=5.0,
+                reasoning=f"所有判断方式均失败，使用默认分数 (last_error={last_error})",
+                should_reply=False, confidence=0.5, overall_score=0.5,
             )
 
-        except Exception as e:
-            logger.error(f"小参数模型判断异常: {e}")
-            return JudgeResult(should_reply=False, reasoning=f"异常: {str(e)}")
+        if used_provider_name != self.judge_provider_name and len(self.judge_provider_chain) > 1:
+            logger.info(f"主 provider 失败，由备用 provider 成功: {used_provider_name}")
+
+        # 从 judge_data 提取分数并钉位到 [0, 10]
+        relevance = _clamp_score(judge_data.get("relevance", 0))
+        willingness = _clamp_score(judge_data.get("willingness", 0))
+        social = _clamp_score(judge_data.get("social", 0))
+        timing = _clamp_score(judge_data.get("timing", 0))
+        continuity = _clamp_score(judge_data.get("continuity", 0))
+
+        # 计算综合评分
+        overall_score = (
+            relevance * self.weights["relevance"] +
+            willingness * self.weights["willingness"] +
+            social * self.weights["social"] +
+            timing * self.weights["timing"] +
+            continuity * self.weights["continuity"]
+        ) / 10.0
+
+        should_reply = overall_score >= self.reply_threshold
+
+        logger.debug(f"小参数模型判断成功，综合评分: {overall_score:.3f}, 是否回复: {should_reply}")
+
+        return JudgeResult(
+            relevance=relevance, willingness=willingness,
+            social=social, timing=timing, continuity=continuity,
+            reasoning=judge_data.get("reasoning", ""),
+            should_reply=should_reply,
+            confidence=overall_score,
+            overall_score=overall_score,
+            related_messages=[],
+        )
 
     def _is_google_provider(self, provider) -> bool:
         """检测 provider 是否为 Google GenAI（支持 structured output）"""
@@ -437,7 +472,7 @@ class HeartflowPlugin(star.Star):
         complete_judge_prompt += "\n\n**重要提醒：你必须严格按照JSON格式返回结果，不要包含任何其他内容！请不要进行对话，只返回JSON！**\n\n"
         complete_judge_prompt += judge_prompt
         complete_judge_prompt += """\n\n请严格按以下JSON格式回复，不要添加任何其他内容：
-{"relevance": 分数, "willingness": 分数, "social": 分数, "timing": 分数, "continuity": 分数}
+{"relevance": 分数, "willingness": 分数, "social": 分数, "timing": 分数, "continuity": 分数, "reasoning": "详细分析原因"}
 """
 
         max_retries = self.judge_max_retries + 1
@@ -503,7 +538,7 @@ class HeartflowPlugin(star.Star):
             judge_result = await self.judge_with_tiny_model(event)
 
             if judge_result.should_reply:
-                logger.info(f"🔥 心流触发主动回复 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f}")
+                logger.info(f"🔥 心流触发主动回复 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
 
                 # 设置唤醒标志为真，调用LLM
                 event.is_at_or_wake_command = True
@@ -512,13 +547,13 @@ class HeartflowPlugin(star.Star):
 
                 # 更新主动回复状态
                 self._update_active_state(event, judge_result)
-                logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f}")
+                logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
                 
                 # 不需要yield任何内容，让核心系统处理
                 return
             else:
                 # 记录被动状态
-                logger.debug(f"心流判断不通过 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f}")
+                logger.debug(f"心流判断不通过 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | 原因: {judge_result.reasoning[:30]}...")
                 self._update_passive_state(event, judge_result)
 
         except Exception as e:
@@ -727,7 +762,7 @@ class HeartflowPlugin(star.Star):
         # 精力恢复（不回复时精力缓慢恢复）
         chat_state.energy = min(1.0, chat_state.energy + self.energy_recovery_rate)
 
-        logger.debug(f"更新被动状态: {chat_id[:20]}... | 精力: {chat_state.energy:.2f}")
+        logger.debug(f"更新被动状态: {chat_id[:20]}... | 精力: {chat_state.energy:.2f} | 原因: {judge_result.reasoning[:30]}...")
 
     # 管理员命令：查看心流状态
     @filter.command("heartflow")
@@ -752,7 +787,7 @@ class HeartflowPlugin(star.Star):
 
 ⚙️ **配置参数**
 - 回复阈值: {self.reply_threshold}
-- 判断提供商: {self.judge_provider_name}
+- 判断提供商链: {' -> '.join(self.judge_provider_chain) if self.judge_provider_chain else '(未配置)'}
 - 最大重试次数: {self.judge_max_retries}
 - 白名单模式: {'✅ 开启' if self.whitelist_enabled else '❌ 关闭'}
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
