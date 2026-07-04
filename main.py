@@ -399,8 +399,17 @@ class HeartflowPlugin(star.Star):
         try:
             from google.genai import types
 
-            response = await judge_provider.client.aio.models.generate_content(
-                model=judge_provider.model_name,
+            client = judge_provider.client
+            model = judge_provider.model_name
+
+            # AsyncClient 直接调用；sync Client 需要通过 .aio 访问
+            if hasattr(client, 'aio'):
+                gen = client.aio.models.generate_content
+            else:
+                gen = client.models.generate_content
+
+            response = await gen(
+                model=model,
                 contents=judge_prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
