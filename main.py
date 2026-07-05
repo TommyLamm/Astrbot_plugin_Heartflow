@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 import time
@@ -49,6 +50,17 @@ class ChatState:
     last_reset_date: str = ""
     total_messages: int = 0
     total_replies: int = 0
+
+
+@dataclass
+class DebounceState:
+    """防抖合并状态"""
+    timer: asyncio.TimerHandle | None = None
+    pending: list = field(default_factory=list)      # [(RawMessage, event), ...] 倒计时窗口内攒的消息
+    cached: list = field(default_factory=list)       # [(RawMessage, event), ...] 判断过程中收到的新消息
+    is_judging: bool = False
+    judge_start_time: float = 0.0
+    watchdog_task: asyncio.Task | None = None
 
 
 def _extract_json(text: str) -> dict:
@@ -150,6 +162,13 @@ class HeartflowPlugin(star.Star):
         self._raw_msg_buffer: Dict[str, deque] = {}
         self._raw_msg_buffer_size = max(self.context_messages_count, self.judge_context_count) * 4  # 缓冲区保留更多条以备用
 
+        # 防抖合并状态
+        self._debounce_states: Dict[str, DebounceState] = {}
+        self.debounce_seconds = self.config.get("debounce_seconds", 5.0)
+        self.judge_timeout_seconds = self.config.get("judge_timeout_seconds", 30.0)
+        self.energy_system_enabled = self.config.get("energy_system_enabled", True)
+        self.max_cached_messages = max(1, self.config.get("max_cached_messages", 10))
+
         # 判断配置
         self.judge_max_retries = max(0, self.config.get("judge_max_retries", 3))  # 确保最小为0
         
@@ -245,50 +264,17 @@ class HeartflowPlugin(star.Star):
 """
 
         # 遍历 fallback 链，依次尝试每个 provider
-        judge_data = None
-        used_provider_name = None
-        last_error = None
-
-        for provider_name in self.judge_provider_chain:
-            try:
-                provider = self.context.get_provider_by_id(provider_name)
-                if not provider:
-                    logger.warning(f"未找到提供商: {provider_name}，尝试下一个")
-                    continue
-
-                # 优先尝试 structured output（仅 Google provider 支持）
-                if self._is_google_provider(provider):
-                    # Google provider: 只走 structured output，失败直接 fallback 到下一个 provider
-                    judge_data = await self._judge_with_structured_output(
-                        provider, judge_prompt
-                    )
-                else:
-                    # 非 Google provider: 走 text_chat
-                    judge_data = await self._judge_with_text_chat(
-                        provider, judge_prompt, persona_system_prompt
-                    )
-
-                if judge_data is not None:
-                    used_provider_name = provider_name
-                    break
-
-            except Exception as e:
-                last_error = e
-                logger.warning(f"provider {provider_name} 判断失败: {e}，尝试下一个")
-                continue
+        judge_data = await self._call_judge_providers(event.unified_msg_origin, judge_prompt, persona_system_prompt)
 
         # 所有 provider 都失败，返回保守默认分数
         if judge_data is None:
-            logger.warning(f"所有判断方式均失败 (last_error={last_error})，返回保守默认分数")
+            logger.warning(f"所有判断方式均失败，返回保守默认分数")
             return JudgeResult(
                 relevance=5.0, willingness=5.0, social=5.0,
                 timing=5.0, continuity=5.0,
-                reasoning=f"所有判断方式均失败，使用默认分数 (last_error={last_error})",
+                reasoning=f"所有判断方式均失败，使用默认分数",
                 should_reply=False, confidence=0.5, overall_score=0.5,
             )
-
-        if used_provider_name != self.judge_provider_name and len(self.judge_provider_chain) > 1:
-            logger.info(f"主 provider 失败，由备用 provider 成功: {used_provider_name}")
 
         # 从 judge_data 提取分数并钉位到 [0, 10]
         relevance = _clamp_score(judge_data.get("relevance", 0))
@@ -319,6 +305,46 @@ class HeartflowPlugin(star.Star):
             overall_score=overall_score,
             related_messages=[],
         )
+
+    async def _call_judge_providers(self, umo: str, judge_prompt: str, persona_system_prompt: str = "") -> dict | None:
+        """遍历 fallback 链尝试 provider，返回解析后的 dict 或 None"""
+        if not self.judge_provider_chain:
+            logger.warning("小参数判断模型提供商名称未配置，跳过心流判断")
+            return None
+
+        judge_data = None
+        used_provider_name = None
+
+        for provider_name in self.judge_provider_chain:
+            try:
+                provider = self.context.get_provider_by_id(provider_name)
+                if not provider:
+                    logger.warning(f"未找到提供商: {provider_name}，尝试下一个")
+                    continue
+
+                # 优先尝试 structured output（仅 Google provider 支持）
+                if self._is_google_provider(provider):
+                    judge_data = await self._judge_with_structured_output(
+                        provider, judge_prompt
+                    )
+                else:
+                    judge_data = await self._judge_with_text_chat(
+                        provider, judge_prompt, persona_system_prompt
+                    )
+
+                if judge_data is not None:
+                    used_provider_name = provider_name
+                    break
+
+            except Exception as e:
+                logger.warning(f"provider {provider_name} 判断失败: {e}，尝试下一个")
+                continue
+
+        if judge_data is not None:
+            if used_provider_name != self.judge_provider_name and len(self.judge_provider_chain) > 1:
+                logger.info(f"主 provider 失败，由备用 provider 兜底成功: {used_provider_name}")
+
+        return judge_data
 
     def _is_google_provider(self, provider) -> bool:
         """检测 provider 是否为 Google GenAI（支持 structured output）"""
@@ -354,7 +380,6 @@ class HeartflowPlugin(star.Star):
         )
 
         max_retries = max(1, self.judge_max_retries)
-        last_err = None
 
         for attempt in range(max_retries):
             try:
@@ -370,7 +395,6 @@ class HeartflowPlugin(star.Star):
                     logger.debug(f"结构化输出成功: {judge_data}")
                 return judge_data
             except Exception as e:
-                last_err = e
                 if attempt < max_retries - 1:
                     logger.warning(f"结构化输出失败 (尝试 {attempt + 1}/{max_retries}): {e}")
                 else:
@@ -394,7 +418,6 @@ class HeartflowPlugin(star.Star):
 """
 
         max_retries = max(1, self.judge_max_retries)
-        last_err = None
 
         for attempt in range(max_retries):
             try:
@@ -411,7 +434,6 @@ class HeartflowPlugin(star.Star):
 
             except (json.JSONDecodeError, ValueError) as e:
                 # HTTP 成功但返回非 JSON，底层不会重试，由上层重试
-                last_err = e
                 if attempt < max_retries - 1:
                     logger.warning(f"text_chat JSON 解析失败 (尝试 {attempt + 1}/{max_retries}): {e}")
                 else:
@@ -451,25 +473,24 @@ class HeartflowPlugin(star.Star):
         self._record_raw_message(event, is_bot=False)
 
         try:
-            # 小参数模型判断是否需要回复
+            # 防抖模式：消息进入防抖窗口或缓存
+            if self.debounce_seconds > 0:
+                self._handle_message_with_debounce(event)
+                return
+
+            # 非防抖模式：直接判断单条消息
             judge_result = await self.judge_with_tiny_model(event)
 
             if judge_result.should_reply:
                 logger.info(f"🔥 心流触发主动回复 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
 
-                # 设置唤醒标志为真，调用LLM
                 event.is_at_or_wake_command = True
-                # 标记为心流触发，供 on_llm_request 钉入角色提示
                 event.set_extra("heartflow_triggered", True)
 
-                # 更新主动回复状态
                 self._update_active_state(event, judge_result)
                 logger.info(f"💖 心流设置唤醒标志 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
-                
-                # 不需要yield任何内容，让核心系统处理
                 return
             else:
-                # 记录被动状态
                 logger.debug(f"心流判断不通过 | {event.unified_msg_origin[:20]}... | 评分:{judge_result.overall_score:.2f} | 原因: {judge_result.reasoning[:30]}...")
                 self._update_passive_state(event, judge_result)
 
@@ -477,6 +498,297 @@ class HeartflowPlugin(star.Star):
             logger.error(f"心流插件处理消息异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+    def _handle_message_with_debounce(self, event: AstrMessageEvent):
+        """防抖模式消息处理：进入 pending 或 cached"""
+        umo = event.unified_msg_origin
+        state = self._get_debounce_state(umo)
+
+        raw_msg = RawMessage(
+            sender_name=event.get_sender_name(),
+            sender_id=str(event.get_sender_id()),
+            content=event.message_str,
+            timestamp=time.time(),
+            is_bot=False,
+        )
+
+        if state.is_judging:
+            # 判断中：消息进入缓存，达到上限时只保留最近N条
+            state.cached.append((raw_msg, event))
+            if len(state.cached) > self.max_cached_messages:
+                state.cached = state.cached[-self.max_cached_messages:]
+            logger.debug(f"判断中，消息进入缓存 [{umo[:20]}...] 缓存 {len(state.cached)} 条")
+            return
+
+        # 非判断中：消息进入 pending，重置倒计时
+        state.pending.append((raw_msg, event))
+        logger.debug(f"防抖入队 [{umo[:20]}...] 当前积压 {len(state.pending)} 条")
+        self._start_debounce_timer(umo)
+
+    def _get_debounce_state(self, umo: str) -> DebounceState:
+        """获取或创建防抖状态"""
+        if umo not in self._debounce_states:
+            self._debounce_states[umo] = DebounceState()
+        return self._debounce_states[umo]
+
+    def _start_debounce_timer(self, umo: str):
+        """启动/重置防抖倒计时"""
+        state = self._get_debounce_state(umo)
+        if state.timer is not None:
+            state.timer.cancel()
+            logger.debug(f"防抖倒计时重置 [{umo[:20]}...] 剩余 {len(state.pending)} 条待判断")
+        loop = asyncio.get_event_loop()
+        state.timer = loop.call_later(
+            self.debounce_seconds,
+            lambda: asyncio.ensure_future(self._on_debounce_timer(umo))
+        )
+
+    async def _on_debounce_timer(self, umo: str):
+        """倒计时回调：开始批量判断"""
+        state = self._get_debounce_state(umo)
+        if not state.pending:
+            return
+
+        # 冷却检查：冷却中则不判断，消息重新进入倒计时
+        if self.min_reply_interval > 0:
+            minutes = self._get_minutes_since_last_reply(umo)
+            elapsed_seconds = minutes * 60
+            if elapsed_seconds < self.min_reply_interval:
+                logger.debug(f"冷却中，距上次回复还有 {self.min_reply_interval - elapsed_seconds:.0f}s，延迟判断 [{umo[:20]}...]")
+                self._start_debounce_timer(umo)
+                return
+
+        batch_items = state.pending
+        state.pending = []
+        state.is_judging = True
+        state.judge_start_time = time.time()
+
+        # 启动超时兜底
+        if state.watchdog_task is not None:
+            state.watchdog_task.cancel()
+        state.watchdog_task = asyncio.ensure_future(self._judge_timeout_watchdog(umo))
+
+        logger.debug(f"防抖窗口结束 [{umo[:20]}...] 共 {len(batch_items)} 条消息，开始判断")
+
+        try:
+            await self._judge_batch(umo, batch_items)
+        except Exception as e:
+            logger.error(f"批量判断异常: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            # 异常时释放锁，处理缓存
+            if state.watchdog_task is not None:
+                state.watchdog_task.cancel()
+            state.is_judging = False
+            self._flush_cached_to_pending(umo)
+
+    async def _judge_batch(self, umo: str, batch_items: list):
+        """批量判断一批消息"""
+        if not batch_items:
+            return
+
+        trigger_event = batch_items[-1][1]  # 最后一条消息的 event
+        batch_raw_msgs = [item[0] for item in batch_items]
+
+        # 获取人格提示词
+        persona_system_prompt = await self._get_persona_system_prompt(trigger_event)
+        logger.debug(f"小参数模型使用人格提示词: {'有' if persona_system_prompt else '无'} | 长度: {len(persona_system_prompt) if persona_system_prompt else 0}")
+
+        # 构建判断上下文
+        chat_state = self._get_chat_state(umo)
+        chat_context = self._build_chat_context(trigger_event)
+        recent_messages = self._get_recent_messages_for_batch(umo, batch_raw_msgs)
+        last_bot_reply = self._get_last_bot_reply_by_umo(umo)
+
+        # 构造 batch 待判断消息文本
+        batch_lines = []
+        for m in batch_raw_msgs:
+            prefix = "[机器人]" if m.is_bot else f"[{m.sender_name}]"
+            time_str = datetime.datetime.fromtimestamp(m.timestamp).strftime('%H:%M:%S')
+            batch_lines.append(f"{prefix} {time_str}: {m.content}")
+        batch_text = "\n".join(batch_lines)
+
+        judge_prompt = f"""
+你是群聊机器人的决策系统，需要判断是否应该主动回复以下消息。
+
+## 机器人角色设定
+{persona_system_prompt if persona_system_prompt else "默认角色：智能助手"}
+
+## 当前群聊情况
+- 群聊ID: {umo}
+- 我的精力水平: {chat_state.energy:.1f}/1.0
+- 上次发言: {self._get_minutes_since_last_reply(umo)}分钟前
+
+## 群聊基本信息
+{chat_context}
+
+## 最近{self.context_messages_count}条对话历史
+{recent_messages}
+
+## 上次机器人回复
+{last_bot_reply if last_bot_reply else "暂无上次回复记录"}
+
+## 待判断消息（本次共 {len(batch_raw_msgs)} 条，是短时间内群里的连续对话）
+{batch_text}
+
+## 评估要求
+请从以下5个维度评估（0-10分），**重要提醒：基于上述机器人角色设定来判断是否适合回复**。
+以上 {len(batch_raw_msgs)} 条消息是短时间内群里的连续对话，请判断是否值得作为一整段参与，而非逐条评估。
+
+1. **内容相关度**(0-10)：消息是否有趣、有价值、适合我回复
+   - 考虑消息的质量、话题性、是否需要回应
+   - 识别并过滤垃圾消息、无意义内容
+   - **结合机器人角色特点，判断是否符合角色定位**
+
+2. **回复意愿**(0-10)：基于当前状态，我回复此消息的意愿
+   - 考虑当前精力水平和心情状态
+   - 考虑今日回复频率控制
+   - **基于机器人角色设定，判断是否应该主动参与此话题**
+
+3. **社交适宜性**(0-10)：在当前群聊氛围下回复是否合适
+   - 考虑群聊活跃度和讨论氛围
+   - **考虑机器人角色在群中的定位和表现方式**
+
+4. **时机恰当性**(0-10)：回复时机是否恰当
+   - 考虑距离上次回复的时间间隔
+   - 考虑消息的紧急性和时效性
+
+5. **对话连贯性**(0-10)：当前消息与上次机器人回复的关联程度
+   - 如果当前消息是对上次回复的回应或延续，应给高分
+   - 如果当前消息与上次回复完全无关，给中等分数
+   - 如果没有上次回复记录，给默认分数5分
+
+**回复阈值**: {self.reply_threshold} (综合评分达到此分数才回复)
+"""
+
+        # 调用 provider fallback 链
+        judge_data = await self._call_judge_providers(umo, judge_prompt, persona_system_prompt)
+
+        state = self._get_debounce_state(umo)
+
+        if judge_data is None:
+            logger.warning(f"所有判断方式均失败，返回保守默认分数 [{umo[:20]}...]")
+            judge_result = JudgeResult(
+                relevance=5.0, willingness=5.0, social=5.0,
+                timing=5.0, continuity=5.0,
+                reasoning="所有判断方式均失败，使用默认分数",
+                should_reply=False, confidence=0.5, overall_score=0.5,
+            )
+        else:
+            relevance = _clamp_score(judge_data.get("relevance", 0))
+            willingness = _clamp_score(judge_data.get("willingness", 0))
+            social = _clamp_score(judge_data.get("social", 0))
+            timing = _clamp_score(judge_data.get("timing", 0))
+            continuity = _clamp_score(judge_data.get("continuity", 0))
+
+            overall_score = (
+                relevance * self.weights["relevance"] +
+                willingness * self.weights["willingness"] +
+                social * self.weights["social"] +
+                timing * self.weights["timing"] +
+                continuity * self.weights["continuity"]
+            ) / 10.0
+
+            should_reply = overall_score >= self.reply_threshold
+
+            judge_result = JudgeResult(
+                relevance=relevance, willingness=willingness,
+                social=social, timing=timing, continuity=continuity,
+                reasoning=judge_data.get("reasoning", ""),
+                should_reply=should_reply,
+                confidence=overall_score,
+                overall_score=overall_score,
+                related_messages=[],
+            )
+
+        if judge_result.should_reply:
+            logger.info(f"🔥 心流触发主动回复 | {umo[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
+            logger.debug(f"判断通过 [{umo[:20]}...] 评分 {judge_result.overall_score:.2f}，触发回复")
+
+            trigger_event.is_at_or_wake_command = True
+            trigger_event.set_extra("heartflow_triggered", True)
+
+            self._update_active_state(trigger_event, judge_result)
+            logger.info(f"💖 心流设置唤醒标志 | {umo[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
+            # 等待 on_after_message_sent 触发后释放锁
+            return
+        else:
+            logger.debug(f"判断不通过 [{umo[:20]}...] 评分 {judge_result.overall_score:.2f}")
+            self._update_passive_state_batch(umo, judge_result, len(batch_items))
+
+            # 释放锁，处理缓存
+            if state.watchdog_task is not None:
+                state.watchdog_task.cancel()
+            state.is_judging = False
+            self._flush_cached_to_pending(umo)
+
+    def _flush_cached_to_pending(self, umo: str):
+        """缓存转 pending，若非空则启动新倒计时"""
+        state = self._get_debounce_state(umo)
+        if state.cached:
+            state.pending = state.cached
+            state.cached = []
+            logger.debug(f"缓存转pending [{umo[:20]}...] {len(state.pending)} 条，启动新倒计时")
+            self._start_debounce_timer(umo)
+        else:
+            logger.debug(f"缓存转pending [{umo[:20]}...] 0 条，状态归零")
+
+    async def _judge_timeout_watchdog(self, umo: str):
+        """超时兜底：防止判断+回复流程卡死"""
+        try:
+            await asyncio.sleep(self.judge_timeout_seconds)
+        except asyncio.CancelledError:
+            return
+        state = self._get_debounce_state(umo)
+        if state.is_judging:
+            logger.warning(f"判断+回复超时 {self.judge_timeout_seconds}s，强制释放 [{umo[:20]}...]")
+            state.is_judging = False
+            self._flush_cached_to_pending(umo)
+
+    def _get_recent_messages_for_batch(self, umo: str, batch_msgs: list) -> str:
+        """获取 batch 之前的历史消息（不含 batch 本身）。
+
+        规则：从 _raw_msg_buffer 取最近 N 条（N=context_messages_count）。
+        batch 消息已通过 _record_raw_message 写入 buffer 末尾，需排除。
+        如果 batch 长度 M >= N，仍取 N 条历史（batch 不截断，全量在 prompt 另一段展示）。
+        """
+        msgs = self._get_raw_buffer(umo)
+        # batch 消息在 buffer 末尾，排除它们
+        m = len(batch_msgs)
+        if m > 0 and len(msgs) >= m:
+            # 检查末尾 m 条是否就是 batch（按内容匹配）
+            history = msgs[:-m] if m > 0 else msgs
+        else:
+            history = msgs
+
+        recent = history[-self.context_messages_count:] if len(history) > self.context_messages_count else history
+
+        if not recent:
+            return "暂无对话历史"
+
+        lines = []
+        for m in recent:
+            prefix = "[机器人]" if m.is_bot else f"[{m.sender_name}]"
+            lines.append(f"{prefix}: {m.content}")
+        return "\n".join(lines)
+
+    def _get_last_bot_reply_by_umo(self, umo: str) -> str | None:
+        """从原始消息缓冲区获取上次机器人的回复内容。"""
+        msgs = self._get_raw_buffer(umo)
+        for m in reversed(msgs):
+            if m.is_bot and m.content.strip():
+                return m.content
+        return None
+
+    def _update_passive_state_batch(self, umo: str, judge_result: JudgeResult, batch_count: int):
+        """更新被动状态（批量，未回复）"""
+        chat_state = self._get_chat_state(umo)
+        chat_state.total_messages += batch_count
+
+        if self.energy_system_enabled:
+            chat_state.energy = min(1.0, chat_state.energy + self.energy_recovery_rate)
+
+        logger.debug(f"更新被动状态(批量) [{umo[:20]}...] | 消息+{batch_count} | 精力: {chat_state.energy:.2f} | 原因: {judge_result.reasoning[:30]}...")
 
     @filter.after_message_sent()
     async def on_after_message_sent(self, event: AstrMessageEvent):
@@ -506,6 +818,18 @@ class HeartflowPlugin(star.Star):
             is_bot=True,
         ))
         logger.debug(f"机器人回复已写入缓冲区: {umo[:20]}... | {reply_text[:40]}...")
+
+        # 防抖模式：释放锁，处理缓存消息
+        if self.debounce_seconds > 0 and umo in self._debounce_states:
+            state = self._debounce_states[umo]
+            if state.is_judging:
+                if state.watchdog_task is not None:
+                    state.watchdog_task.cancel()
+                state.is_judging = False
+                logger.debug(f"回复已发送 [{umo[:20]}...] 释放锁，处理缓存 {len(state.cached)} 条")
+                self._flush_cached_to_pending(umo)
+            else:
+                logger.debug(f"回复已发送但 is_judging 已为 False（可能被 watchdog 释放）[{umo[:20]}...]")
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req):
@@ -568,8 +892,14 @@ class HeartflowPlugin(star.Star):
 
         if state.last_reset_date != today:
             state.last_reset_date = today
-            # 每日重置时恒复一些精力
-            state.energy = min(1.0, state.energy + 0.2)
+            if self.energy_system_enabled:
+                # 每日重置时恢复一些精力
+                state.energy = min(1.0, state.energy + 0.2)
+
+        # 精力系统关闭时恒为 1.0
+        if not self.energy_system_enabled:
+            state.energy = 1.0
+            return state
 
         # 基于时间流逝自然恢复精力（距上次回复每过 5 分钟回复 1% 精力）
         if state.last_reply_time > 0:
@@ -664,7 +994,8 @@ class HeartflowPlugin(star.Star):
         chat_state.total_messages += 1
 
         # 精力消耗（回复后精力下降）
-        chat_state.energy = max(0.1, chat_state.energy - self.energy_decay_rate)
+        if self.energy_system_enabled:
+            chat_state.energy = max(0.1, chat_state.energy - self.energy_decay_rate)
 
         logger.debug(f"更新主动状态: {chat_id[:20]}... | 精力: {chat_state.energy:.2f}")
 
@@ -677,7 +1008,8 @@ class HeartflowPlugin(star.Star):
         chat_state.total_messages += 1
 
         # 精力恢复（不回复时精力缓慢恢复）
-        chat_state.energy = min(1.0, chat_state.energy + self.energy_recovery_rate)
+        if self.energy_system_enabled:
+            chat_state.energy = min(1.0, chat_state.energy + self.energy_recovery_rate)
 
         logger.debug(f"更新被动状态: {chat_id[:20]}... | 精力: {chat_state.energy:.2f} | 原因: {judge_result.reasoning[:30]}...")
 
@@ -708,6 +1040,10 @@ class HeartflowPlugin(star.Star):
 - 最大重试次数: {self.judge_max_retries}
 - 白名单模式: {'✅ 开启' if self.whitelist_enabled else '❌ 关闭'}
 - 白名单群聊数: {len(self.chat_whitelist) if self.whitelist_enabled else 0}
+- 防抖时间: {self.debounce_seconds}s
+- 判断超时: {self.judge_timeout_seconds}s
+- 精力系统: {'✅ 开启' if self.energy_system_enabled else '❌ 关闭'}
+- 缓存消息上限: {self.max_cached_messages}
 
 🎯 **评分权重**
 - 内容相关度: {self.weights['relevance']:.0%}
