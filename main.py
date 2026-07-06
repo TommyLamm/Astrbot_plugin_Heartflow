@@ -3,6 +3,7 @@ import json
 import re
 import time
 import datetime
+import uuid
 from collections import deque
 from typing import Dict
 from dataclasses import dataclass, field
@@ -42,6 +43,15 @@ class RawMessage:
     content: str
     timestamp: float
     is_bot: bool = False
+    message_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+
+@dataclass
+class QueuedMessage:
+    """一條等待防抖判斷結果的消息。"""
+    raw_message: RawMessage
+    event: object
+    waiter: asyncio.Future
 
 
 @dataclass
@@ -58,16 +68,13 @@ class ChatState:
 class DebounceState:
     """防抖合并状态"""
     timer: asyncio.TimerHandle | None = None
-    pending: list = field(default_factory=list)      # [(RawMessage, event), ...] 倒计时窗口内攒的消息
-    future: asyncio.Future | None = None             # 当前批次的判断结果 Future，await 它的是各消息的 on_group_message
+    timer_generation: int = 0
+    pending: list[QueuedMessage] = field(default_factory=list)
     is_judging: bool = False
     judge_start_time: float = 0.0
-    watchdog_task: asyncio.Task | None = None
-    batch_events: list = field(default_factory=list)  # 当前批次参与 await 的 event 列表快照
+    judge_task: asyncio.Task | None = None
     # 旧批次仍在判断时，新消息进入下一批
-    next_pending: list = field(default_factory=list)
-    next_future: asyncio.Future | None = None
-    next_timer: asyncio.TimerHandle | None = None
+    next_pending: list[QueuedMessage] = field(default_factory=list)
 
 
 def _extract_json(text: str) -> dict:
@@ -451,18 +458,20 @@ class HeartflowPlugin(star.Star):
                 return None
         return None
 
-    def _record_raw_message(self, event: AstrMessageEvent, is_bot: bool = False) -> None:
+    def _record_raw_message(self, event: AstrMessageEvent, is_bot: bool = False) -> RawMessage:
         """将消息写入原始消息缓冲区"""
         umo = event.unified_msg_origin
         if umo not in self._raw_msg_buffer:
             self._raw_msg_buffer[umo] = deque(maxlen=self._raw_msg_buffer_size)
-        self._raw_msg_buffer[umo].append(RawMessage(
+        raw_message = RawMessage(
             sender_name=event.get_sender_name(),
             sender_id=str(event.get_sender_id()),
             content=event.message_str,
             timestamp=time.time(),
             is_bot=is_bot,
-        ))
+        )
+        self._raw_msg_buffer[umo].append(raw_message)
+        return raw_message
 
     def _get_raw_buffer(self, umo: str) -> list[RawMessage]:
         """获取缓冲区中的消息列表（时间顺序）"""
@@ -477,12 +486,12 @@ class HeartflowPlugin(star.Star):
             return
 
         # 第一时间记录原始消息，无论是否最终触发 LLM
-        self._record_raw_message(event, is_bot=False)
+        raw_message = self._record_raw_message(event, is_bot=False)
 
         try:
             # 防抖模式：消息进入防抖窗口，await 判断结果 Future
             if self.debounce_seconds > 0:
-                await self._handle_message_with_debounce(event)
+                await self._handle_message_with_debounce(event, raw_message)
                 return
 
             # 非防抖模式：直接判断单条消息
@@ -506,7 +515,11 @@ class HeartflowPlugin(star.Star):
             import traceback
             logger.error(traceback.format_exc())
 
-    async def _handle_message_with_debounce(self, event: AstrMessageEvent):
+    async def _handle_message_with_debounce(
+        self,
+        event: AstrMessageEvent,
+        raw_message: RawMessage | None = None,
+    ):
         """防抖模式消息处理：加入 pending，启动/重置倒计时，并 await 判断结果 Future。
 
         每条消息的 on_group_message 都会阻塞在 await Future 上，
@@ -516,41 +529,39 @@ class HeartflowPlugin(star.Star):
         umo = event.unified_msg_origin
         state = self._get_debounce_state(umo)
 
-        raw_msg = RawMessage(
+        raw_msg = raw_message or RawMessage(
             sender_name=event.get_sender_name(),
             sender_id=str(event.get_sender_id()),
             content=event.message_str,
             timestamp=time.time(),
             is_bot=False,
         )
+        waiter = asyncio.get_running_loop().create_future()
+        queued = QueuedMessage(raw_message=raw_msg, event=event, waiter=waiter)
 
         # 判断中收到的新消息：进入"下一批"，等旧批次结束后由 _promote_next_pending 接管
         if state.is_judging:
-            state.next_pending.append((raw_msg, event))
+            state.next_pending.append(queued)
             if len(state.next_pending) > self.max_cached_messages:
-                state.next_pending = state.next_pending[-self.max_cached_messages:]
+                evicted = state.next_pending.pop(0)
+                evicted.event.stop_event()
+                if not evicted.waiter.done():
+                    evicted.waiter.set_result(JudgeResult(
+                        should_reply=False,
+                        reasoning="下一批缓存已满，释放较旧消息",
+                    ))
             logger.debug(f"判断中，消息进入下一批缓存 [{umo[:20]}...] 下一批 {len(state.next_pending)} 条")
-            # 为下一批准备 future（若还没有），本条 await 它
-            if state.next_future is None:
-                state.next_future = asyncio.get_event_loop().create_future()
-            try:
-                judge_result = await state.next_future
-            except Exception:
-                event.stop_event()
-                return
-            self._apply_judge_result_to_event(event, judge_result)
-            return
+        else:
+            # 非判断中：进入 pending，启动倒计时
+            state.pending.append(queued)
+            logger.debug(f"防抖入队 [{umo[:20]}...] 当前积压 {len(state.pending)} 条")
+            self._start_debounce_timer(umo)
 
-        # 非判断中：进入 pending，启动倒计时
-        state.pending.append((raw_msg, event))
-        logger.debug(f"防抖入队 [{umo[:20]}...] 当前积压 {len(state.pending)} 条")
-        self._start_debounce_timer(umo)
-
-        # 等待判断结果（阻塞当前 event 的 pipeline）
-        if state.future is None:
-            state.future = asyncio.get_event_loop().create_future()
+        # shield 避免一條 event 被取消時連帶取消同批的結果。
         try:
-            judge_result = await state.future
+            judge_result = await asyncio.shield(waiter)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             event.stop_event()
             return
@@ -582,21 +593,26 @@ class HeartflowPlugin(star.Star):
             self._debounce_states[umo] = DebounceState()
         return self._debounce_states[umo]
 
-    def _start_debounce_timer(self, umo: str):
+    def _start_debounce_timer(self, umo: str, delay: float | None = None):
         """启动/重置防抖倒计时（当前批次）"""
         state = self._get_debounce_state(umo)
         if state.timer is not None:
             state.timer.cancel()
             logger.debug(f"防抖倒计时重置 [{umo[:20]}...] 剩余 {len(state.pending)} 条待判断")
-        loop = asyncio.get_event_loop()
+        state.timer_generation += 1
+        generation = state.timer_generation
+        loop = asyncio.get_running_loop()
         state.timer = loop.call_later(
-            self.debounce_seconds,
-            lambda: asyncio.ensure_future(self._on_debounce_timer(umo))
+            self.debounce_seconds if delay is None else max(0.0, delay),
+            lambda: asyncio.create_task(self._on_debounce_timer(umo, generation))
         )
 
-    async def _on_debounce_timer(self, umo: str):
+    async def _on_debounce_timer(self, umo: str, generation: int | None = None):
         """倒计时回调：开始批量判断（当前批次）"""
         state = self._get_debounce_state(umo)
+        if generation is not None and generation != state.timer_generation:
+            return
+        state.timer = None
         if not state.pending:
             return
 
@@ -609,40 +625,42 @@ class HeartflowPlugin(star.Star):
                 self._start_debounce_timer(umo)
                 return
 
-        batch_items = state.pending
+        queued_batch = state.pending
         state.pending = []
         state.is_judging = True
         state.judge_start_time = time.time()
-        state.batch_events = [item[1] for item in batch_items]
-
-        # 确保 future 存在（on_group_message 里已创建，但兜底）
-        if state.future is None:
-            state.future = asyncio.get_event_loop().create_future()
-
-        # 启动超时兜底
-        if state.watchdog_task is not None:
-            state.watchdog_task.cancel()
-        state.watchdog_task = asyncio.ensure_future(self._judge_timeout_watchdog(umo))
+        batch_items = [(item.raw_message, item.event) for item in queued_batch]
 
         logger.debug(f"防抖窗口结束 [{umo[:20]}...] 共 {len(batch_items)} 条消息，开始判断")
 
+        judge_result = None
         try:
-            judge_result = await self._judge_batch(umo, batch_items)
-            if not state.future.done():
-                state.future.set_result(judge_result)
+            state.judge_task = asyncio.create_task(self._judge_batch(umo, batch_items))
+            judge_result = await asyncio.wait_for(
+                state.judge_task,
+                timeout=max(0.0, self.judge_timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"判断超时 {self.judge_timeout_seconds}s，取消判断 [{umo[:20]}...]")
+            judge_result = JudgeResult(
+                relevance=5.0, willingness=5.0, social=5.0,
+                timing=5.0, continuity=5.0,
+                reasoning="判断超时，使用默认分数",
+                should_reply=False, confidence=0.5, overall_score=0.5,
+            )
         except Exception as e:
             logger.error(f"批量判断异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            if not state.future.done():
-                state.future.set_exception(e)
+            judge_result = JudgeResult(should_reply=False, reasoning=f"批量判断异常: {e}")
         finally:
             state.is_judging = False
-            if state.watchdog_task is not None:
-                state.watchdog_task.cancel()
-                state.watchdog_task = None
-            state.future = None
-            state.batch_events = []
+            state.judge_task = None
+            if judge_result is None:
+                judge_result = JudgeResult(should_reply=False, reasoning="判断被取消")
+            for queued_message in queued_batch:
+                if not queued_message.waiter.done():
+                    queued_message.waiter.set_result(judge_result)
             # 旧批次结束，若有 next_pending 则转为新批次
             self._promote_next_pending(umo)
 
@@ -653,10 +671,6 @@ class HeartflowPlugin(star.Star):
             return
         state.pending = state.next_pending
         state.next_pending = []
-        # 把 next_future 提升为 future，_on_debounce_timer 会 set_result 到它
-        state.future = state.next_future
-        state.next_future = None
-        state.next_timer = None
         logger.debug(f"下一批提升为新批次 [{umo[:20]}...] {len(state.pending)} 条，启动新倒计时")
         self._start_debounce_timer(umo)
 
@@ -786,22 +800,6 @@ class HeartflowPlugin(star.Star):
             self._update_passive_state_batch(umo, judge_result, len(batch_items))
 
         return judge_result
-
-    async def _judge_timeout_watchdog(self, umo: str):
-        """超时兜底：判断超时则强制 set_result 默认分数，释放所有等待的 event"""
-        try:
-            await asyncio.sleep(self.judge_timeout_seconds)
-        except asyncio.CancelledError:
-            return
-        state = self._get_debounce_state(umo)
-        if state.is_judging and state.future is not None and not state.future.done():
-            logger.warning(f"判断超时 {self.judge_timeout_seconds}s，强制释放 [{umo[:20]}...]")
-            state.future.set_result(JudgeResult(
-                relevance=5.0, willingness=5.0, social=5.0,
-                timing=5.0, continuity=5.0,
-                reasoning="判断超时，使用默认分数",
-                should_reply=False, confidence=0.5, overall_score=0.5,
-            ))
 
     def _get_recent_messages_for_batch(self, umo: str, batch_msgs: list) -> str:
         """获取 batch 之前的历史消息（不含 batch 本身）。
