@@ -62,8 +62,8 @@ async def test_batch_reaches_reply_llm_without_rewriting_prompt(plugin_factory):
 
 
 @pytest.mark.anyio
-async def test_timeout_cancels_judge_and_promotes_next_batch(plugin_factory):
-    plugin = plugin_factory(debounce_seconds=0.005, judge_timeout_seconds=0.02)
+async def test_provider_timeout_does_not_cancel_whole_batch(plugin_factory):
+    plugin = plugin_factory(debounce_seconds=0.005, judge_timeout_seconds=0.01)
     calls = 0
     first_cancelled = asyncio.Event()
 
@@ -72,7 +72,7 @@ async def test_timeout_cancels_judge_and_promotes_next_batch(plugin_factory):
         calls += 1
         if calls == 1:
             try:
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.05)
             except asyncio.CancelledError:
                 first_cancelled.set()
                 raise
@@ -88,9 +88,9 @@ async def test_timeout_cancels_judge_and_promotes_next_batch(plugin_factory):
 
     await asyncio.wait_for(asyncio.gather(first, second), timeout=0.3)
 
-    assert first_cancelled.is_set()
+    assert first_cancelled.is_set() is False
     assert calls == 2
-    assert time.monotonic() - start < 0.1
+    assert time.monotonic() - start >= 0.05
 
 
 @pytest.mark.anyio
@@ -266,3 +266,122 @@ def test_successful_batch_counts_every_message_once(plugin_factory):
     state = plugin.chat_states[event.unified_msg_origin]
     assert state.total_messages == 3
     assert state.total_replies == 1
+
+
+class FakeJudgeProvider:
+    def __init__(self, result=None, delay=0):
+        self.result = result
+        self.delay = delay
+        self.calls = 0
+        self.cancelled = False
+
+    async def run(self):
+        self.calls += 1
+        try:
+            await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+        return self.result
+
+
+class FakeProviderContext:
+    def __init__(self, providers):
+        self.providers = providers
+
+    def get_provider_by_id(self, provider_id):
+        return self.providers.get(provider_id)
+
+
+@pytest.mark.anyio
+async def test_provider_timeout_allows_fallback_to_succeed(plugin_factory):
+    first = FakeJudgeProvider(delay=0.2)
+    expected = {
+        "relevance": 8,
+        "willingness": 8,
+        "social": 8,
+        "timing": 8,
+        "continuity": 8,
+        "reasoning": "fallback succeeded",
+    }
+    second = FakeJudgeProvider(result=expected)
+    plugin = plugin_factory(judge_timeout_seconds=0.02)
+    plugin.context = FakeProviderContext({"first": first, "second": second})
+    plugin.judge_provider_name = "first"
+    plugin.judge_provider_chain = ["first", "second"]
+    plugin._is_google_provider = lambda _provider: False
+
+    async def call_text(provider, _prompt, _persona):
+        return await provider.run()
+
+    plugin._judge_with_text_chat = call_text
+
+    result = await asyncio.wait_for(
+        plugin._call_judge_providers("umo", "prompt"),
+        timeout=0.15,
+    )
+
+    assert result == expected
+    assert first.calls == 1
+    assert first.cancelled is True
+    assert second.calls == 1
+
+
+@pytest.mark.anyio
+async def test_all_provider_timeouts_return_none_without_pending_tasks(plugin_factory):
+    first = FakeJudgeProvider(delay=0.2)
+    second = FakeJudgeProvider(delay=0.2)
+    plugin = plugin_factory(judge_timeout_seconds=0.01)
+    plugin.context = FakeProviderContext({"first": first, "second": second})
+    plugin.judge_provider_name = "first"
+    plugin.judge_provider_chain = ["first", "second"]
+    plugin._is_google_provider = lambda _provider: False
+
+    async def call_text(provider, _prompt, _persona):
+        return await provider.run()
+
+    plugin._judge_with_text_chat = call_text
+    started = time.monotonic()
+
+    result = await asyncio.wait_for(
+        plugin._call_judge_providers("umo", "prompt"),
+        timeout=0.15,
+    )
+
+    assert result is None
+    assert first.cancelled is True
+    assert second.cancelled is True
+    assert first.calls == 1 and second.calls == 1
+    assert time.monotonic() - started < 0.1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure_mode", ["none", "exception"])
+async def test_invalid_provider_result_continues_fallback(
+    plugin_factory,
+    failure_mode,
+):
+    first = FakeJudgeProvider()
+    expected = {"relevance": 7, "reasoning": "second provider"}
+    second = FakeJudgeProvider(result=expected)
+    plugin = plugin_factory(judge_timeout_seconds=0.02)
+    plugin.context = FakeProviderContext({"first": first, "second": second})
+    plugin.judge_provider_name = "first"
+    plugin.judge_provider_chain = ["first", "second"]
+    plugin._is_google_provider = lambda _provider: False
+
+    async def call_text(provider, _prompt, _persona):
+        if provider is first:
+            first.calls += 1
+            if failure_mode == "exception":
+                raise RuntimeError("provider failed")
+            return None
+        return await provider.run()
+
+    plugin._judge_with_text_chat = call_text
+
+    result = await plugin._call_judge_providers("umo", "prompt")
+
+    assert result == expected
+    assert first.calls == 1
+    assert second.calls == 1

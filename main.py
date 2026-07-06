@@ -331,7 +331,9 @@ class HeartflowPlugin(star.Star):
         judge_data = None
         used_provider_name = None
 
-        for provider_name in self.judge_provider_chain:
+        provider_count = len(self.judge_provider_chain)
+        for provider_index, provider_name in enumerate(self.judge_provider_chain, start=1):
+            started_at = time.monotonic()
             try:
                 provider = self.context.get_provider_by_id(provider_name)
                 if not provider:
@@ -340,20 +342,52 @@ class HeartflowPlugin(star.Star):
 
                 # 优先尝试 structured output（仅 Google provider 支持）
                 if self._is_google_provider(provider):
-                    judge_data = await self._judge_with_structured_output(
+                    call_path = "structured_output"
+                    provider_call = self._judge_with_structured_output(
                         provider, judge_prompt
                     )
                 else:
-                    judge_data = await self._judge_with_text_chat(
+                    call_path = "text_chat"
+                    provider_call = self._judge_with_text_chat(
                         provider, judge_prompt, persona_system_prompt
                     )
 
+                logger.debug(
+                    f"开始判断 provider [{provider_index}/{provider_count}] "
+                    f"{provider_name} | 路径: {call_path} | "
+                    f"超时: {self.judge_timeout_seconds}s"
+                )
+                judge_data = await asyncio.wait_for(
+                    provider_call,
+                    timeout=max(0.0, self.judge_timeout_seconds),
+                )
+                elapsed = time.monotonic() - started_at
+
                 if judge_data is not None:
                     used_provider_name = provider_name
+                    logger.info(
+                        f"判断 provider 成功: {provider_name} | 耗时: {elapsed:.2f}s"
+                    )
                     break
 
+                logger.warning(
+                    f"判断 provider 未返回有效结果: {provider_name} | "
+                    f"耗时: {elapsed:.2f}s，尝试下一个"
+                )
+
+            except asyncio.TimeoutError:
+                elapsed = time.monotonic() - started_at
+                logger.warning(
+                    f"判断 provider 超时: {provider_name} | "
+                    f"耗时: {elapsed:.2f}s，尝试下一个"
+                )
+                continue
             except Exception as e:
-                logger.warning(f"provider {provider_name} 判断失败: {e}，尝试下一个")
+                elapsed = time.monotonic() - started_at
+                logger.warning(
+                    f"provider {provider_name} 判断失败: {e} | "
+                    f"耗时: {elapsed:.2f}s，尝试下一个"
+                )
                 continue
 
         if judge_data is not None:
@@ -638,19 +672,7 @@ class HeartflowPlugin(star.Star):
         judge_result = None
         try:
             state.judge_task = asyncio.create_task(self._judge_batch(umo, batch_items))
-            judge_result = await asyncio.wait_for(
-                state.judge_task,
-                timeout=max(0.0, self.judge_timeout_seconds),
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"判断超时 {self.judge_timeout_seconds}s，取消判断 [{umo[:20]}...]")
-            judge_result = JudgeResult(
-                relevance=5.0, willingness=5.0, social=5.0,
-                timing=5.0, continuity=5.0,
-                reasoning="判断超时，使用默认分数",
-                should_reply=False, confidence=0.5, overall_score=0.5,
-                batch_size=len(batch_items),
-            )
+            judge_result = await state.judge_task
         except Exception as e:
             logger.error(f"批量判断异常: {e}")
             import traceback
