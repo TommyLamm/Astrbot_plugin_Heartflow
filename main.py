@@ -26,6 +26,7 @@ class JudgeResult:
     confidence: float = 0.0
     overall_score: float = 0.0
     related_messages: list = None
+    trigger_event: object = None  # 批量判断时，被选为走 LLM 的主 event 引用
 
     def __post_init__(self):
         if self.related_messages is None:
@@ -57,10 +58,15 @@ class DebounceState:
     """防抖合并状态"""
     timer: asyncio.TimerHandle | None = None
     pending: list = field(default_factory=list)      # [(RawMessage, event), ...] 倒计时窗口内攒的消息
-    cached: list = field(default_factory=list)       # [(RawMessage, event), ...] 判断过程中收到的新消息
+    future: asyncio.Future | None = None             # 当前批次的判断结果 Future，await 它的是各消息的 on_group_message
     is_judging: bool = False
     judge_start_time: float = 0.0
     watchdog_task: asyncio.Task | None = None
+    batch_events: list = field(default_factory=list)  # 当前批次参与 await 的 event 列表快照
+    # 旧批次仍在判断时，新消息进入下一批
+    next_pending: list = field(default_factory=list)
+    next_future: asyncio.Future | None = None
+    next_timer: asyncio.TimerHandle | None = None
 
 
 def _extract_json(text: str) -> dict:
@@ -473,9 +479,9 @@ class HeartflowPlugin(star.Star):
         self._record_raw_message(event, is_bot=False)
 
         try:
-            # 防抖模式：消息进入防抖窗口或缓存
+            # 防抖模式：消息进入防抖窗口，await 判断结果 Future
             if self.debounce_seconds > 0:
-                self._handle_message_with_debounce(event)
+                await self._handle_message_with_debounce(event)
                 return
 
             # 非防抖模式：直接判断单条消息
@@ -499,8 +505,13 @@ class HeartflowPlugin(star.Star):
             import traceback
             logger.error(traceback.format_exc())
 
-    def _handle_message_with_debounce(self, event: AstrMessageEvent):
-        """防抖模式消息处理：进入 pending 或 cached"""
+    async def _handle_message_with_debounce(self, event: AstrMessageEvent):
+        """防抖模式消息处理：加入 pending，启动/重置倒计时，并 await 判断结果 Future。
+
+        每条消息的 on_group_message 都会阻塞在 await Future 上，
+        直到倒计时结束、_judge_batch 完成并 set_result。
+        判断通过则只让最后一条消息的 event 走 LLM，其余 stop_event。
+        """
         umo = event.unified_msg_origin
         state = self._get_debounce_state(umo)
 
@@ -512,18 +523,56 @@ class HeartflowPlugin(star.Star):
             is_bot=False,
         )
 
+        # 判断中收到的新消息：进入"下一批"，等旧批次结束后由 _promote_next_pending 接管
         if state.is_judging:
-            # 判断中：消息进入缓存，达到上限时只保留最近N条
-            state.cached.append((raw_msg, event))
-            if len(state.cached) > self.max_cached_messages:
-                state.cached = state.cached[-self.max_cached_messages:]
-            logger.debug(f"判断中，消息进入缓存 [{umo[:20]}...] 缓存 {len(state.cached)} 条")
+            state.next_pending.append((raw_msg, event))
+            if len(state.next_pending) > self.max_cached_messages:
+                state.next_pending = state.next_pending[-self.max_cached_messages:]
+            logger.debug(f"判断中，消息进入下一批缓存 [{umo[:20]}...] 下一批 {len(state.next_pending)} 条")
+            # 为下一批准备 future（若还没有），本条 await 它
+            if state.next_future is None:
+                state.next_future = asyncio.get_event_loop().create_future()
+            try:
+                judge_result = await state.next_future
+            except Exception:
+                event.stop_event()
+                return
+            self._apply_judge_result_to_event(event, judge_result)
             return
 
-        # 非判断中：消息进入 pending，重置倒计时
+        # 非判断中：进入 pending，启动倒计时
         state.pending.append((raw_msg, event))
         logger.debug(f"防抖入队 [{umo[:20]}...] 当前积压 {len(state.pending)} 条")
         self._start_debounce_timer(umo)
+
+        # 等待判断结果（阻塞当前 event 的 pipeline）
+        if state.future is None:
+            state.future = asyncio.get_event_loop().create_future()
+        try:
+            judge_result = await state.future
+        except Exception:
+            event.stop_event()
+            return
+
+        self._apply_judge_result_to_event(event, judge_result)
+
+    def _apply_judge_result_to_event(self, event: AstrMessageEvent, judge_result: JudgeResult):
+        """根据判断结果决定当前 event 的去留。"""
+        umo = event.unified_msg_origin
+        if judge_result.should_reply:
+            # 只让主 event（最后一条消息）走 LLM，其他 stop
+            if judge_result.trigger_event is event:
+                event.is_at_or_wake_command = True
+                event.set_extra("heartflow_triggered", True)
+                self._update_active_state(event, judge_result)
+                logger.info(f"💖 心流设置唤醒标志 | {umo[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
+                return  # pipeline 继续走 LLM
+            else:
+                event.stop_event()
+                return
+        else:
+            event.stop_event()
+            return
 
     def _get_debounce_state(self, umo: str) -> DebounceState:
         """获取或创建防抖状态"""
@@ -532,7 +581,7 @@ class HeartflowPlugin(star.Star):
         return self._debounce_states[umo]
 
     def _start_debounce_timer(self, umo: str):
-        """启动/重置防抖倒计时"""
+        """启动/重置防抖倒计时（当前批次）"""
         state = self._get_debounce_state(umo)
         if state.timer is not None:
             state.timer.cancel()
@@ -544,7 +593,7 @@ class HeartflowPlugin(star.Star):
         )
 
     async def _on_debounce_timer(self, umo: str):
-        """倒计时回调：开始批量判断"""
+        """倒计时回调：开始批量判断（当前批次）"""
         state = self._get_debounce_state(umo)
         if not state.pending:
             return
@@ -562,6 +611,11 @@ class HeartflowPlugin(star.Star):
         state.pending = []
         state.is_judging = True
         state.judge_start_time = time.time()
+        state.batch_events = [item[1] for item in batch_items]
+
+        # 确保 future 存在（on_group_message 里已创建，但兜底）
+        if state.future is None:
+            state.future = asyncio.get_event_loop().create_future()
 
         # 启动超时兜底
         if state.watchdog_task is not None:
@@ -571,21 +625,43 @@ class HeartflowPlugin(star.Star):
         logger.debug(f"防抖窗口结束 [{umo[:20]}...] 共 {len(batch_items)} 条消息，开始判断")
 
         try:
-            await self._judge_batch(umo, batch_items)
+            judge_result = await self._judge_batch(umo, batch_items)
+            if not state.future.done():
+                state.future.set_result(judge_result)
         except Exception as e:
             logger.error(f"批量判断异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            # 异常时释放锁，处理缓存
+            if not state.future.done():
+                state.future.set_exception(e)
+        finally:
+            state.is_judging = False
             if state.watchdog_task is not None:
                 state.watchdog_task.cancel()
-            state.is_judging = False
-            self._flush_cached_to_pending(umo)
+                state.watchdog_task = None
+            state.future = None
+            state.batch_events = []
+            # 旧批次结束，若有 next_pending 则转为新批次
+            self._promote_next_pending(umo)
 
-    async def _judge_batch(self, umo: str, batch_items: list):
-        """批量判断一批消息"""
-        if not batch_items:
+    def _promote_next_pending(self, umo: str):
+        """旧批次结束后，把 next_pending 提升为新批次并启动倒计时。"""
+        state = self._get_debounce_state(umo)
+        if not state.next_pending:
             return
+        state.pending = state.next_pending
+        state.next_pending = []
+        # 把 next_future 提升为 future，_on_debounce_timer 会 set_result 到它
+        state.future = state.next_future
+        state.next_future = None
+        state.next_timer = None
+        logger.debug(f"下一批提升为新批次 [{umo[:20]}...] {len(state.pending)} 条，启动新倒计时")
+        self._start_debounce_timer(umo)
+
+    async def _judge_batch(self, umo: str, batch_items: list) -> JudgeResult:
+        """批量判断一批消息，只返回 JudgeResult（不触发回复，不更新状态）"""
+        if not batch_items:
+            return JudgeResult(should_reply=False, reasoning="空批次")
 
         trigger_event = batch_items[-1][1]  # 最后一条消息的 event
         batch_raw_msgs = [item[0] for item in batch_items]
@@ -664,86 +740,66 @@ class HeartflowPlugin(star.Star):
         # 调用 provider fallback 链
         judge_data = await self._call_judge_providers(umo, judge_prompt, persona_system_prompt)
 
-        state = self._get_debounce_state(umo)
-
         if judge_data is None:
             logger.warning(f"所有判断方式均失败，返回保守默认分数 [{umo[:20]}...]")
-            judge_result = JudgeResult(
+            return JudgeResult(
                 relevance=5.0, willingness=5.0, social=5.0,
                 timing=5.0, continuity=5.0,
                 reasoning="所有判断方式均失败，使用默认分数",
                 should_reply=False, confidence=0.5, overall_score=0.5,
             )
-        else:
-            relevance = _clamp_score(judge_data.get("relevance", 0))
-            willingness = _clamp_score(judge_data.get("willingness", 0))
-            social = _clamp_score(judge_data.get("social", 0))
-            timing = _clamp_score(judge_data.get("timing", 0))
-            continuity = _clamp_score(judge_data.get("continuity", 0))
 
-            overall_score = (
-                relevance * self.weights["relevance"] +
-                willingness * self.weights["willingness"] +
-                social * self.weights["social"] +
-                timing * self.weights["timing"] +
-                continuity * self.weights["continuity"]
-            ) / 10.0
+        relevance = _clamp_score(judge_data.get("relevance", 0))
+        willingness = _clamp_score(judge_data.get("willingness", 0))
+        social = _clamp_score(judge_data.get("social", 0))
+        timing = _clamp_score(judge_data.get("timing", 0))
+        continuity = _clamp_score(judge_data.get("continuity", 0))
 
-            should_reply = overall_score >= self.reply_threshold
+        overall_score = (
+            relevance * self.weights["relevance"] +
+            willingness * self.weights["willingness"] +
+            social * self.weights["social"] +
+            timing * self.weights["timing"] +
+            continuity * self.weights["continuity"]
+        ) / 10.0
 
-            judge_result = JudgeResult(
-                relevance=relevance, willingness=willingness,
-                social=social, timing=timing, continuity=continuity,
-                reasoning=judge_data.get("reasoning", ""),
-                should_reply=should_reply,
-                confidence=overall_score,
-                overall_score=overall_score,
-                related_messages=[],
-            )
+        should_reply = overall_score >= self.reply_threshold
+
+        judge_result = JudgeResult(
+            relevance=relevance, willingness=willingness,
+            social=social, timing=timing, continuity=continuity,
+            reasoning=judge_data.get("reasoning", ""),
+            should_reply=should_reply,
+            confidence=overall_score,
+            overall_score=overall_score,
+            related_messages=[],
+            trigger_event=trigger_event if should_reply else None,
+        )
 
         if judge_result.should_reply:
             logger.info(f"🔥 心流触发主动回复 | {umo[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
-            logger.debug(f"判断通过 [{umo[:20]}...] 评分 {judge_result.overall_score:.2f}，触发回复")
-
-            trigger_event.is_at_or_wake_command = True
-            trigger_event.set_extra("heartflow_triggered", True)
-
-            self._update_active_state(trigger_event, judge_result)
-            logger.info(f"💖 心流设置唤醒标志 | {umo[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
-            # 等待 on_after_message_sent 触发后释放锁
-            return
         else:
             logger.debug(f"判断不通过 [{umo[:20]}...] 评分 {judge_result.overall_score:.2f}")
+            # 批量更新被动状态
             self._update_passive_state_batch(umo, judge_result, len(batch_items))
 
-            # 释放锁，处理缓存
-            if state.watchdog_task is not None:
-                state.watchdog_task.cancel()
-            state.is_judging = False
-            self._flush_cached_to_pending(umo)
-
-    def _flush_cached_to_pending(self, umo: str):
-        """缓存转 pending，若非空则启动新倒计时"""
-        state = self._get_debounce_state(umo)
-        if state.cached:
-            state.pending = state.cached
-            state.cached = []
-            logger.debug(f"缓存转pending [{umo[:20]}...] {len(state.pending)} 条，启动新倒计时")
-            self._start_debounce_timer(umo)
-        else:
-            logger.debug(f"缓存转pending [{umo[:20]}...] 0 条，状态归零")
+        return judge_result
 
     async def _judge_timeout_watchdog(self, umo: str):
-        """超时兜底：防止判断+回复流程卡死"""
+        """超时兜底：判断超时则强制 set_result 默认分数，释放所有等待的 event"""
         try:
             await asyncio.sleep(self.judge_timeout_seconds)
         except asyncio.CancelledError:
             return
         state = self._get_debounce_state(umo)
-        if state.is_judging:
-            logger.warning(f"判断+回复超时 {self.judge_timeout_seconds}s，强制释放 [{umo[:20]}...]")
-            state.is_judging = False
-            self._flush_cached_to_pending(umo)
+        if state.is_judging and state.future is not None and not state.future.done():
+            logger.warning(f"判断超时 {self.judge_timeout_seconds}s，强制释放 [{umo[:20]}...]")
+            state.future.set_result(JudgeResult(
+                relevance=5.0, willingness=5.0, social=5.0,
+                timing=5.0, continuity=5.0,
+                reasoning="判断超时，使用默认分数",
+                should_reply=False, confidence=0.5, overall_score=0.5,
+            ))
 
     def _get_recent_messages_for_batch(self, umo: str, batch_msgs: list) -> str:
         """获取 batch 之前的历史消息（不含 batch 本身）。
@@ -818,18 +874,6 @@ class HeartflowPlugin(star.Star):
             is_bot=True,
         ))
         logger.debug(f"机器人回复已写入缓冲区: {umo[:20]}... | {reply_text[:40]}...")
-
-        # 防抖模式：释放锁，处理缓存消息
-        if self.debounce_seconds > 0 and umo in self._debounce_states:
-            state = self._debounce_states[umo]
-            if state.is_judging:
-                if state.watchdog_task is not None:
-                    state.watchdog_task.cancel()
-                state.is_judging = False
-                logger.debug(f"回复已发送 [{umo[:20]}...] 释放锁，处理缓存 {len(state.cached)} 条")
-                self._flush_cached_to_pending(umo)
-            else:
-                logger.debug(f"回复已发送但 is_judging 已为 False（可能被 watchdog 释放）[{umo[:20]}...]")
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req):
