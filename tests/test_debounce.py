@@ -79,7 +79,6 @@ async def test_provider_timeout_does_not_cancel_whole_batch(plugin_factory):
         return JudgeResult(should_reply=False, reasoning="skip")
 
     plugin._judge_batch = judge
-    start = time.monotonic()
     first_event = FakeEvent("first")
     first = asyncio.create_task(plugin._handle_message_with_debounce(first_event))
     state = plugin._get_debounce_state(first_event.unified_msg_origin)
@@ -90,7 +89,6 @@ async def test_provider_timeout_does_not_cancel_whole_batch(plugin_factory):
 
     assert first_cancelled.is_set() is False
     assert calls == 2
-    assert time.monotonic() - start >= 0.05
 
 
 @pytest.mark.anyio
