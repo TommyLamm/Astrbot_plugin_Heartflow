@@ -11,6 +11,7 @@ import astrbot.api.star as star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api import logger
 from astrbot.api.message_components import Plain
+from astrbot.core.agent.message import TextPart
 
 
 @dataclass
@@ -564,6 +565,7 @@ class HeartflowPlugin(star.Star):
             if judge_result.trigger_event is event:
                 event.is_at_or_wake_command = True
                 event.set_extra("heartflow_triggered", True)
+                event.set_extra("heartflow_batch_messages", judge_result.related_messages)
                 self._update_active_state(event, judge_result)
                 logger.info(f"💖 心流设置唤醒标志 | {umo[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
                 return  # pipeline 继续走 LLM
@@ -772,7 +774,7 @@ class HeartflowPlugin(star.Star):
             should_reply=should_reply,
             confidence=overall_score,
             overall_score=overall_score,
-            related_messages=[],
+            related_messages=batch_raw_msgs,
             trigger_event=trigger_event if should_reply else None,
         )
 
@@ -884,6 +886,21 @@ class HeartflowPlugin(star.Star):
             return
         note = "（注意：本次是你主动参与群聊的，不是用户叫你。回复应自然随意，像普通群成员一样加入话题。）"
         req.system_prompt = (req.system_prompt or "") + "\n" + note
+
+        batch_messages = event.get_extra("heartflow_batch_messages", [])
+        prior_messages = batch_messages[:-1]
+        if prior_messages and hasattr(req, "extra_user_content_parts"):
+            lines = []
+            for message in prior_messages:
+                time_str = datetime.datetime.fromtimestamp(message.timestamp).strftime("%H:%M:%S")
+                lines.append(f"[{message.sender_name}/{time_str}]: {message.content}")
+            req.extra_user_content_parts.append(TextPart(
+                text=(
+                    "<system_reminder>以下是本次防抖窗口中、当前消息之前的群聊消息：\n"
+                    + "\n".join(lines)
+                    + "\n</system_reminder>"
+                )
+            ))
 
     def _should_process_message(self, event: AstrMessageEvent) -> bool:
         """检查是否应该处理这条消息"""
