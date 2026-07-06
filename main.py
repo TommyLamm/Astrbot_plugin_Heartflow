@@ -29,6 +29,7 @@ class JudgeResult:
     overall_score: float = 0.0
     related_messages: list = None
     trigger_event: object = None  # 批量判断时，被选为走 LLM 的主 event 引用
+    batch_size: int = 1
 
     def __post_init__(self):
         if self.related_messages is None:
@@ -59,6 +60,7 @@ class ChatState:
     """群聊状态数据类"""
     energy: float = 1.0
     last_reply_time: float = 0.0
+    last_energy_update_time: float = 0.0
     last_reset_date: str = ""
     total_messages: int = 0
     total_replies: int = 0
@@ -618,11 +620,11 @@ class HeartflowPlugin(star.Star):
 
         # 冷却检查：冷却中则不判断，消息重新进入倒计时
         if self.min_reply_interval > 0:
-            minutes = self._get_minutes_since_last_reply(umo)
-            elapsed_seconds = minutes * 60
+            elapsed_seconds = self._get_seconds_since_last_reply(umo)
             if elapsed_seconds < self.min_reply_interval:
-                logger.debug(f"冷却中，距上次回复还有 {self.min_reply_interval - elapsed_seconds:.0f}s，延迟判断 [{umo[:20]}...]")
-                self._start_debounce_timer(umo)
+                remaining = self.min_reply_interval - elapsed_seconds
+                logger.debug(f"冷却中，距上次回复还有 {remaining:.0f}s，延迟判断 [{umo[:20]}...]")
+                self._start_debounce_timer(umo, delay=remaining)
                 return
 
         queued_batch = state.pending
@@ -647,17 +649,28 @@ class HeartflowPlugin(star.Star):
                 timing=5.0, continuity=5.0,
                 reasoning="判断超时，使用默认分数",
                 should_reply=False, confidence=0.5, overall_score=0.5,
+                batch_size=len(batch_items),
             )
         except Exception as e:
             logger.error(f"批量判断异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            judge_result = JudgeResult(should_reply=False, reasoning=f"批量判断异常: {e}")
+            judge_result = JudgeResult(
+                should_reply=False,
+                reasoning=f"批量判断异常: {e}",
+                batch_size=len(batch_items),
+            )
         finally:
             state.is_judging = False
             state.judge_task = None
             if judge_result is None:
-                judge_result = JudgeResult(should_reply=False, reasoning="判断被取消")
+                judge_result = JudgeResult(
+                    should_reply=False,
+                    reasoning="判断被取消",
+                    batch_size=len(batch_items),
+                )
+            if not judge_result.should_reply:
+                self._update_passive_state_batch(umo, judge_result, len(batch_items))
             for queued_message in queued_batch:
                 if not queued_message.waiter.done():
                     queued_message.waiter.set_result(judge_result)
@@ -763,6 +776,7 @@ class HeartflowPlugin(star.Star):
                 timing=5.0, continuity=5.0,
                 reasoning="所有判断方式均失败，使用默认分数",
                 should_reply=False, confidence=0.5, overall_score=0.5,
+                batch_size=len(batch_items),
             )
 
         relevance = _clamp_score(judge_data.get("relevance", 0))
@@ -790,14 +804,13 @@ class HeartflowPlugin(star.Star):
             overall_score=overall_score,
             related_messages=batch_raw_msgs,
             trigger_event=trigger_event if should_reply else None,
+            batch_size=len(batch_items),
         )
 
         if judge_result.should_reply:
             logger.info(f"🔥 心流触发主动回复 | {umo[:20]}... | 评分:{judge_result.overall_score:.2f} | {judge_result.reasoning[:50]}...")
         else:
             logger.debug(f"判断不通过 [{umo[:20]}...] 评分 {judge_result.overall_score:.2f}")
-            # 批量更新被动状态
-            self._update_passive_state_batch(umo, judge_result, len(batch_items))
 
         return judge_result
 
@@ -809,11 +822,16 @@ class HeartflowPlugin(star.Star):
         如果 batch 长度 M >= N，仍取 N 条历史（batch 不截断，全量在 prompt 另一段展示）。
         """
         msgs = self._get_raw_buffer(umo)
-        # batch 消息在 buffer 末尾，排除它们
-        m = len(batch_msgs)
-        if m > 0 and len(msgs) >= m:
-            # 检查末尾 m 条是否就是 batch（按内容匹配）
-            history = msgs[:-m] if m > 0 else msgs
+        batch_ids = {message.message_id for message in batch_msgs}
+        batch_positions = [
+            index for index, message in enumerate(msgs)
+            if message.message_id in batch_ids
+        ]
+        if batch_positions:
+            history = msgs[:min(batch_positions)]
+        elif batch_msgs:
+            first_batch_time = min(message.timestamp for message in batch_msgs)
+            history = [message for message in msgs if message.timestamp < first_batch_time]
         else:
             history = msgs
 
@@ -931,7 +949,7 @@ class HeartflowPlugin(star.Star):
             return False
 
         # 冷却时间校验：防止短时间内连续触发
-        if self.min_reply_interval > 0:
+        if self.min_reply_interval > 0 and self.debounce_seconds <= 0:
             minutes = self._get_minutes_since_last_reply(event.unified_msg_origin)
             elapsed_seconds = minutes * 60
             if elapsed_seconds < self.min_reply_interval:
@@ -960,12 +978,15 @@ class HeartflowPlugin(star.Star):
             state.energy = 1.0
             return state
 
-        # 基于时间流逝自然恢复精力（距上次回复每过 5 分钟回复 1% 精力）
-        if state.last_reply_time > 0:
-            elapsed_minutes = (time.time() - state.last_reply_time) / 60.0
+        # 基于时间流逝自然恢复精力，不改写真实的上次回复时间。
+        now = time.time()
+        if state.last_energy_update_time <= 0:
+            state.last_energy_update_time = state.last_reply_time or now
+        if state.last_energy_update_time > 0:
+            elapsed_minutes = (now - state.last_energy_update_time) / 60.0
             time_recovery = elapsed_minutes * (self.energy_recovery_rate * 5)
             state.energy = min(1.0, state.energy + time_recovery)
-            state.last_reply_time = time.time()  # 重置计时起点，避免重复累加
+            state.last_energy_update_time = now
 
         return state
 
@@ -977,6 +998,13 @@ class HeartflowPlugin(star.Star):
             return 999  # 从未回复过
 
         return int((time.time() - chat_state.last_reply_time) / 60)
+
+    def _get_seconds_since_last_reply(self, chat_id: str) -> float:
+        """获取距离上次回复的秒数，保留小数用于精确安排冷却。"""
+        chat_state = self._get_chat_state(chat_id)
+        if chat_state.last_reply_time == 0:
+            return float("inf")
+        return max(0.0, time.time() - chat_state.last_reply_time)
 
     def _get_recent_messages(self, event: AstrMessageEvent) -> str:
         """从原始消息缓冲区获取最近的消息历史（用于小参数模型判断）。
@@ -1048,9 +1076,11 @@ class HeartflowPlugin(star.Star):
         chat_state = self._get_chat_state(chat_id)
 
         # 更新回复相关状态
-        chat_state.last_reply_time = time.time()
+        now = time.time()
+        chat_state.last_reply_time = now
+        chat_state.last_energy_update_time = now
         chat_state.total_replies += 1
-        chat_state.total_messages += 1
+        chat_state.total_messages += max(1, judge_result.batch_size)
 
         # 精力消耗（回复后精力下降）
         if self.energy_system_enabled:

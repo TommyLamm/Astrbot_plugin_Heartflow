@@ -1,9 +1,10 @@
 import asyncio
 import time
+from collections import deque
 
 import pytest
 
-from main import JudgeResult, RawMessage
+from main import ChatState, JudgeResult, RawMessage
 from conftest import FakeEvent, FakeRequest
 
 
@@ -179,3 +180,89 @@ async def test_stale_timer_generation_cannot_consume_reset_batch(plugin_factory)
     )
     await asyncio.wait_for(waiter, timeout=0.1)
     assert calls == 1
+
+
+def test_batch_history_excludes_current_and_later_messages(plugin_factory):
+    plugin = plugin_factory(context_messages_count=10)
+    umo = "test:GroupMessage:group"
+    old = RawMessage("old-user", "0", "old history", 1.0)
+    first = RawMessage("alice", "1", "batch first", 2.0)
+    second = RawMessage("bob", "2", "batch second", 3.0)
+    later = RawMessage("carol", "3", "next batch", 4.0)
+    plugin._raw_msg_buffer[umo] = deque([old, first, second, later], maxlen=40)
+
+    history = plugin._get_recent_messages_for_batch(umo, [first, second])
+
+    assert "old history" in history
+    assert "batch first" not in history
+    assert "batch second" not in history
+    assert "next batch" not in history
+
+
+def test_debounce_mode_queues_messages_during_reply_cooldown(plugin_factory):
+    plugin = plugin_factory(debounce_seconds=1, min_reply_interval=60)
+    event = FakeEvent("during reply")
+    plugin.chat_states[event.unified_msg_origin] = ChatState(
+        last_reply_time=time.time(),
+    )
+
+    assert plugin._should_process_message(event) is True
+
+
+@pytest.mark.anyio
+async def test_cooldown_reschedules_for_actual_remaining_seconds(plugin_factory):
+    plugin = plugin_factory(debounce_seconds=100, min_reply_interval=10)
+    event = FakeEvent("queued")
+    plugin.chat_states[event.unified_msg_origin] = ChatState(
+        last_reply_time=time.time() - 1,
+    )
+    waiter = asyncio.create_task(plugin._handle_message_with_debounce(event))
+    await asyncio.sleep(0)
+    state = plugin._get_debounce_state(event.unified_msg_origin)
+    state.timer.cancel()
+    captured_delays = []
+    plugin._start_debounce_timer = (
+        lambda _umo, delay=None: captured_delays.append(delay)
+    )
+
+    await plugin._on_debounce_timer(
+        event.unified_msg_origin,
+        state.timer_generation,
+    )
+
+    assert len(captured_delays) == 1
+    assert 8 <= captured_delays[0] <= 10
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+
+def test_energy_recovery_does_not_change_last_reply_time(plugin_factory):
+    plugin = plugin_factory()
+    umo = "test:GroupMessage:group"
+    reply_time = time.time() - 120
+    plugin.chat_states[umo] = ChatState(
+        energy=0.5,
+        last_reply_time=reply_time,
+    )
+
+    plugin._get_chat_state(umo)
+
+    assert plugin.chat_states[umo].last_reply_time == reply_time
+
+
+def test_successful_batch_counts_every_message_once(plugin_factory):
+    plugin = plugin_factory()
+    event = FakeEvent("latest")
+    result = JudgeResult(
+        should_reply=True,
+        reasoning="reply",
+        trigger_event=event,
+        batch_size=3,
+    )
+
+    plugin._apply_judge_result_to_event(event, result)
+
+    state = plugin.chat_states[event.unified_msg_origin]
+    assert state.total_messages == 3
+    assert state.total_replies == 1

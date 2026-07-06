@@ -124,6 +124,8 @@ def plugin_factory():
         plugin.debounce_seconds = 0.01
         plugin.judge_timeout_seconds = 0.05
         plugin.min_reply_interval = 0
+        plugin.whitelist_enabled = False
+        plugin.chat_whitelist = []
         plugin.max_cached_messages = 10
         plugin.energy_system_enabled = True
         plugin.energy_decay_rate = 0.1
