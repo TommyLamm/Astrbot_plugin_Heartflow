@@ -138,10 +138,10 @@
     "hint": "收到消息后等待N秒，期间收到新消息则重置倒计时，倒计时结束后合并判断。0表示禁用防抖，逐条判断"
   },
   "judge_timeout_seconds": {
-    "description": "判断+回复超时时间(秒)",
+    "description": "单个判断提供商超时时间(秒)",
     "type": "float",
     "default": 30.0,
-    "hint": "判断通过后等待AI回复的超时时间，超时后强制释放防抖锁并处理缓存消息。防止因核心未发送消息导致缓存卡死"
+    "hint": "每个判断provider的完整调用最多等待N秒；超时后自动尝试下一个备用provider。整条链最坏等待时间约为N乘以已配置provider数量"
   },
   "energy_system_enabled": {
     "description": "启用精力系统",
