@@ -167,7 +167,7 @@ def parse_response(response: Any) -> dict | None:
     return None
 
 
-async def test_async_client(api_key: str, model: str) -> None:
+async def run_async_client(api_key: str, model: str) -> None:
     """测试 AsyncClient 路径（AstrBot provider.client 实际使用的类型）。"""
     print_separator(f"AsyncClient 测试 | 模型: {model}")
 
@@ -245,7 +245,7 @@ async def test_async_client(api_key: str, model: str) -> None:
         traceback.print_exc()
 
 
-async def test_plain_text_chat(api_key: str, model: str) -> None:
+async def run_plain_text_chat(api_key: str, model: str) -> None:
     """对比测试: 不用 structured output，纯 prompt 要求 JSON。"""
     print_separator(f"纯 text_chat 对比测试 | 模型: {model}")
 
@@ -311,8 +311,8 @@ def main() -> None:
     print(f"API Key: {api_key[:8]}...{api_key[-4:]} (长度 {len(api_key)})")
     print(f"测试模型: {model}")
 
-    asyncio.run(test_async_client(api_key, model))
-    asyncio.run(test_plain_text_chat(api_key, model))
+    asyncio.run(run_async_client(api_key, model))
+    asyncio.run(run_plain_text_chat(api_key, model))
 
     print_separator("测试完成")
 
