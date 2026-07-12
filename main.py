@@ -173,6 +173,9 @@ class HeartflowPlugin(star.Star):
         # 群聊状态管理
         self.chat_states: Dict[str, ChatState] = {}
 
+        # Provider 统计异步写入任务；写库不应占用判断模型的超时额度
+        self._provider_stat_tasks: set[asyncio.Task] = set()
+
         # 原始群聊消息缓冲区：{unified_msg_origin: deque[RawMessage]}
         # 记录所有群聊原始消息（无论是否触发 LLM），用于判断上下文
         self._raw_msg_buffer: Dict[str, deque] = {}
@@ -334,6 +337,7 @@ class HeartflowPlugin(star.Star):
         provider_count = len(self.judge_provider_chain)
         for provider_index, provider_name in enumerate(self.judge_provider_chain, start=1):
             started_at = time.monotonic()
+            started_wall_time = time.time()
             try:
                 provider = self.context.get_provider_by_id(provider_name)
                 if not provider:
@@ -344,12 +348,12 @@ class HeartflowPlugin(star.Star):
                 if self._is_google_provider(provider):
                     call_path = "structured_output"
                     provider_call = self._judge_with_structured_output(
-                        provider, judge_prompt
+                        provider, judge_prompt, umo
                     )
                 else:
                     call_path = "text_chat"
                     provider_call = self._judge_with_text_chat(
-                        provider, judge_prompt, persona_system_prompt
+                        provider, judge_prompt, persona_system_prompt, umo
                     )
 
                 logger.debug(
@@ -377,6 +381,14 @@ class HeartflowPlugin(star.Star):
 
             except asyncio.TimeoutError:
                 elapsed = time.monotonic() - started_at
+                self._schedule_provider_stat(
+                    umo,
+                    provider,
+                    {"input_other": 0, "input_cached": 0, "output": 0},
+                    started_wall_time,
+                    time.time(),
+                    "aborted",
+                )
                 logger.warning(
                     f"判断 provider 超时: {provider_name} | "
                     f"耗时: {elapsed:.2f}s，尝试下一个"
@@ -407,7 +419,92 @@ class HeartflowPlugin(star.Star):
         except Exception:
             return False
 
-    async def _judge_with_structured_output(self, judge_provider, judge_prompt: str) -> dict | None:
+    def _schedule_provider_stat(
+        self,
+        umo: str,
+        provider,
+        token_usage: dict,
+        start_time: float,
+        end_time: float,
+        status: str,
+    ) -> None:
+        """异步写入一次判断模型调用统计，不阻塞 provider fallback。"""
+        try:
+            get_db = getattr(self.context, "get_db", None)
+            if not callable(get_db):
+                return
+            db = get_db()
+            if not hasattr(db, "insert_provider_stat"):
+                return
+
+            provider_config = getattr(provider, "provider_config", {}) or {}
+            provider_id = provider_config.get("id", "")
+            if not provider_id:
+                provider_id = provider.meta().id
+
+            get_model = getattr(provider, "get_model", None)
+            provider_model = (
+                get_model()
+                if callable(get_model)
+                else getattr(provider, "model_name", None)
+            )
+            task = asyncio.create_task(
+                self._persist_provider_stat(
+                    db=db,
+                    umo=umo,
+                    provider_id=provider_id,
+                    provider_model=provider_model,
+                    status=status,
+                    token_usage=token_usage,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+            )
+            tasks = getattr(self, "_provider_stat_tasks", None)
+            if tasks is None:
+                tasks = set()
+                self._provider_stat_tasks = tasks
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+        except Exception as e:
+            logger.warning(f"建立判断模型统计任务失败: {e}")
+
+    async def _persist_provider_stat(
+        self,
+        *,
+        db,
+        umo: str,
+        provider_id: str,
+        provider_model: str | None,
+        status: str,
+        token_usage: dict,
+        start_time: float,
+        end_time: float,
+    ) -> None:
+        """将判断模型调用写入 AstrBot provider_stats。"""
+        try:
+            await db.insert_provider_stat(
+                umo=umo,
+                provider_id=provider_id,
+                provider_model=provider_model,
+                status=status,
+                stats={
+                    "token_usage": token_usage,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "time_to_first_token": 0.0,
+                },
+                agent_type="internal",
+            )
+        except Exception as e:
+            logger.warning(f"写入判断模型 Token 统计失败: {e}")
+
+    async def _judge_with_structured_output(
+        self,
+        judge_provider,
+        judge_prompt: str,
+        umo: str = "",
+    ) -> dict | None:
         """使用 Google GenAI 原生结构化输出进行判断。
 
         返回解析后的 dict，或在失败时返回 None。
@@ -432,12 +529,43 @@ class HeartflowPlugin(star.Star):
         max_retries = max(1, self.judge_max_retries)
 
         for attempt in range(max_retries):
+            call_started_at = time.time()
             try:
                 response = await gen(
                     model=model,
                     contents=judge_prompt,
                     config=config,
                 )
+            except Exception as e:
+                self._schedule_provider_stat(
+                    umo,
+                    judge_provider,
+                    {"input_other": 0, "input_cached": 0, "output": 0},
+                    call_started_at,
+                    time.time(),
+                    "error",
+                )
+                if attempt < max_retries - 1:
+                    logger.warning(f"结构化输出失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                else:
+                    logger.warning(f"结构化输出重试 {max_retries} 次后仍失败: {e}")
+                continue
+
+            usage = getattr(response, "usage_metadata", None)
+            self._schedule_provider_stat(
+                umo,
+                judge_provider,
+                {
+                    "input_other": getattr(usage, "prompt_token_count", 0) or 0,
+                    "input_cached": getattr(usage, "cached_content_token_count", 0) or 0,
+                    "output": getattr(usage, "candidates_token_count", 0) or 0,
+                },
+                call_started_at,
+                time.time(),
+                "completed",
+            )
+
+            try:
                 judge_data = json.loads(response.text)
                 if attempt > 0:
                     logger.info(f"结构化输出在第 {attempt + 1} 次尝试成功: {judge_data}")
@@ -451,7 +579,13 @@ class HeartflowPlugin(star.Star):
                     logger.warning(f"结构化输出重试 {max_retries} 次后仍失败: {e}")
         return None
 
-    async def _judge_with_text_chat(self, judge_provider, judge_prompt: str, persona_system_prompt: str) -> dict | None:
+    async def _judge_with_text_chat(
+        self,
+        judge_provider,
+        judge_prompt: str,
+        persona_system_prompt: str,
+        umo: str = "",
+    ) -> dict | None:
         """使用 text_chat 进行判断（适用于非 Google 提供商）。
 
         返回解析后的 dict，或在失败时返回 None。
@@ -470,13 +604,41 @@ class HeartflowPlugin(star.Star):
         max_retries = max(1, self.judge_max_retries)
 
         for attempt in range(max_retries):
+            call_started_at = time.time()
             try:
                 llm_response = await judge_provider.text_chat(
                     prompt=complete_judge_prompt,
                     contexts=[],  # 不传对话历史，防止角色扮演污染
                     image_urls=[],
                 )
+            except Exception as e:
+                # HTTP 错误底层已重试过，直接放弃
+                self._schedule_provider_stat(
+                    umo,
+                    judge_provider,
+                    {"input_other": 0, "input_cached": 0, "output": 0},
+                    call_started_at,
+                    time.time(),
+                    "error",
+                )
+                logger.warning(f"text_chat 调用失败: {e}")
+                return None
 
+            usage = getattr(llm_response, "usage", None)
+            self._schedule_provider_stat(
+                umo,
+                judge_provider,
+                {
+                    "input_other": getattr(usage, "input_other", 0) or 0,
+                    "input_cached": getattr(usage, "input_cached", 0) or 0,
+                    "output": getattr(usage, "output", 0) or 0,
+                },
+                call_started_at,
+                time.time(),
+                "completed",
+            )
+
+            try:
                 content = llm_response.completion_text.strip()
                 logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
 
@@ -489,8 +651,7 @@ class HeartflowPlugin(star.Star):
                 else:
                     logger.warning(f"text_chat JSON 解析重试 {max_retries} 次后仍失败: {e}")
             except Exception as e:
-                # HTTP 错误底层已重试过，直接放弃
-                logger.warning(f"text_chat 调用失败: {e}")
+                logger.warning(f"text_chat 返回处理失败: {e}")
                 return None
         return None
 

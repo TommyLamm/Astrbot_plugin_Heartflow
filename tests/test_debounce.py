@@ -309,7 +309,7 @@ async def test_provider_timeout_allows_fallback_to_succeed(plugin_factory):
     plugin.judge_provider_chain = ["first", "second"]
     plugin._is_google_provider = lambda _provider: False
 
-    async def call_text(provider, _prompt, _persona):
+    async def call_text(provider, _prompt, _persona, _umo=""):
         return await provider.run()
 
     plugin._judge_with_text_chat = call_text
@@ -335,7 +335,7 @@ async def test_all_provider_timeouts_return_none_without_pending_tasks(plugin_fa
     plugin.judge_provider_chain = ["first", "second"]
     plugin._is_google_provider = lambda _provider: False
 
-    async def call_text(provider, _prompt, _persona):
+    async def call_text(provider, _prompt, _persona, _umo=""):
         return await provider.run()
 
     plugin._judge_with_text_chat = call_text
@@ -368,7 +368,7 @@ async def test_invalid_provider_result_continues_fallback(
     plugin.judge_provider_chain = ["first", "second"]
     plugin._is_google_provider = lambda _provider: False
 
-    async def call_text(provider, _prompt, _persona):
+    async def call_text(provider, _prompt, _persona, _umo=""):
         if provider is first:
             first.calls += 1
             if failure_mode == "exception":
