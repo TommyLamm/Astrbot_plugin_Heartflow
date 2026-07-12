@@ -1,0 +1,1 @@
+astrbot-model-usage @ https://github.com/TommyLamm/astrbot-model-usage/releases/download/v0.1.0/astrbot_model_usage-0.1.0-py3-none-any.whl

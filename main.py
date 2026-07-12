@@ -13,6 +13,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api import logger
 from astrbot.api.message_components import Plain
 from astrbot.core.agent.message import TextPart
+from astrbot_model_usage import schedule_model_usage
 
 
 @dataclass
@@ -344,12 +345,12 @@ class HeartflowPlugin(star.Star):
                 if self._is_google_provider(provider):
                     call_path = "structured_output"
                     provider_call = self._judge_with_structured_output(
-                        provider, judge_prompt
+                        provider, judge_prompt, umo
                     )
                 else:
                     call_path = "text_chat"
                     provider_call = self._judge_with_text_chat(
-                        provider, judge_prompt, persona_system_prompt
+                        provider, judge_prompt, persona_system_prompt, umo
                     )
 
                 logger.debug(
@@ -407,7 +408,9 @@ class HeartflowPlugin(star.Star):
         except Exception:
             return False
 
-    async def _judge_with_structured_output(self, judge_provider, judge_prompt: str) -> dict | None:
+    async def _judge_with_structured_output(
+        self, judge_provider, judge_prompt: str, umo: str
+    ) -> dict | None:
         """使用 Google GenAI 原生结构化输出进行判断。
 
         返回解析后的 dict，或在失败时返回 None。
@@ -432,12 +435,51 @@ class HeartflowPlugin(star.Star):
         max_retries = max(1, self.judge_max_retries)
 
         for attempt in range(max_retries):
+            started_at = time.time()
             try:
                 response = await gen(
                     model=model,
                     contents=judge_prompt,
                     config=config,
                 )
+            except asyncio.CancelledError:
+                schedule_model_usage(
+                    context=self.context,
+                    umo=umo,
+                    provider=judge_provider,
+                    provider_model=model,
+                    status="aborted",
+                    started_at=started_at,
+                    ended_at=time.time(),
+                )
+                raise
+            except Exception as e:
+                schedule_model_usage(
+                    context=self.context,
+                    umo=umo,
+                    provider=judge_provider,
+                    provider_model=model,
+                    status="error",
+                    started_at=started_at,
+                    ended_at=time.time(),
+                )
+                if attempt < max_retries - 1:
+                    logger.warning(f"结构化输出失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                else:
+                    logger.warning(f"结构化输出重试 {max_retries} 次后仍失败: {e}")
+                continue
+
+            schedule_model_usage(
+                context=self.context,
+                umo=umo,
+                provider=judge_provider,
+                provider_model=model,
+                response=response,
+                status="completed",
+                started_at=started_at,
+                ended_at=time.time(),
+            )
+            try:
                 judge_data = json.loads(response.text)
                 if attempt > 0:
                     logger.info(f"结构化输出在第 {attempt + 1} 次尝试成功: {judge_data}")
@@ -446,12 +488,18 @@ class HeartflowPlugin(star.Star):
                 return judge_data
             except Exception as e:
                 if attempt < max_retries - 1:
-                    logger.warning(f"结构化输出失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    logger.warning(f"结构化输出 JSON 解析失败 (尝试 {attempt + 1}/{max_retries}): {e}")
                 else:
-                    logger.warning(f"结构化输出重试 {max_retries} 次后仍失败: {e}")
+                    logger.warning(f"结构化输出 JSON 解析重试 {max_retries} 次后仍失败: {e}")
         return None
 
-    async def _judge_with_text_chat(self, judge_provider, judge_prompt: str, persona_system_prompt: str) -> dict | None:
+    async def _judge_with_text_chat(
+        self,
+        judge_provider,
+        judge_prompt: str,
+        persona_system_prompt: str,
+        umo: str,
+    ) -> dict | None:
         """使用 text_chat 进行判断（适用于非 Google 提供商）。
 
         返回解析后的 dict，或在失败时返回 None。
@@ -470,28 +518,57 @@ class HeartflowPlugin(star.Star):
         max_retries = max(1, self.judge_max_retries)
 
         for attempt in range(max_retries):
+            started_at = time.time()
             try:
                 llm_response = await judge_provider.text_chat(
                     prompt=complete_judge_prompt,
                     contexts=[],  # 不传对话历史，防止角色扮演污染
                     image_urls=[],
                 )
+            except asyncio.CancelledError:
+                schedule_model_usage(
+                    context=self.context,
+                    umo=umo,
+                    provider=judge_provider,
+                    status="aborted",
+                    started_at=started_at,
+                    ended_at=time.time(),
+                )
+                raise
+            except Exception as e:
+                schedule_model_usage(
+                    context=self.context,
+                    umo=umo,
+                    provider=judge_provider,
+                    status="error",
+                    started_at=started_at,
+                    ended_at=time.time(),
+                )
+                # HTTP 错误底层已重试过，直接放弃
+                logger.warning(f"text_chat 调用失败: {e}")
+                return None
 
+            schedule_model_usage(
+                context=self.context,
+                umo=umo,
+                provider=judge_provider,
+                response=llm_response,
+                status="completed",
+                started_at=started_at,
+                ended_at=time.time(),
+            )
+            try:
                 content = llm_response.completion_text.strip()
                 logger.debug(f"小参数模型原始返回内容: {content[:200]}...")
 
                 return _extract_json(content)
 
-            except (json.JSONDecodeError, ValueError) as e:
+            except Exception as e:
                 # HTTP 成功但返回非 JSON，底层不会重试，由上层重试
                 if attempt < max_retries - 1:
                     logger.warning(f"text_chat JSON 解析失败 (尝试 {attempt + 1}/{max_retries}): {e}")
                 else:
                     logger.warning(f"text_chat JSON 解析重试 {max_retries} 次后仍失败: {e}")
-            except Exception as e:
-                # HTTP 错误底层已重试过，直接放弃
-                logger.warning(f"text_chat 调用失败: {e}")
-                return None
         return None
 
     def _record_raw_message(self, event: AstrMessageEvent, is_bot: bool = False) -> RawMessage:
