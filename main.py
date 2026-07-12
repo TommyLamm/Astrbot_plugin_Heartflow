@@ -15,6 +15,8 @@ from astrbot.api.message_components import Plain
 from astrbot.core.agent.message import TextPart
 from astrbot_model_usage import schedule_model_usage
 
+MODEL_USAGE_SOURCE = "heartflow"
+
 
 @dataclass
 class JudgeResult:
@@ -448,6 +450,7 @@ class HeartflowPlugin(star.Star):
                     umo=umo,
                     provider=judge_provider,
                     provider_model=model,
+                    source=MODEL_USAGE_SOURCE,
                     status="aborted",
                     started_at=started_at,
                     ended_at=time.time(),
@@ -459,6 +462,7 @@ class HeartflowPlugin(star.Star):
                     umo=umo,
                     provider=judge_provider,
                     provider_model=model,
+                    source=MODEL_USAGE_SOURCE,
                     status="error",
                     started_at=started_at,
                     ended_at=time.time(),
@@ -474,6 +478,7 @@ class HeartflowPlugin(star.Star):
                 umo=umo,
                 provider=judge_provider,
                 provider_model=model,
+                source=MODEL_USAGE_SOURCE,
                 response=response,
                 status="completed",
                 started_at=started_at,
@@ -530,6 +535,7 @@ class HeartflowPlugin(star.Star):
                     context=self.context,
                     umo=umo,
                     provider=judge_provider,
+                    source=MODEL_USAGE_SOURCE,
                     status="aborted",
                     started_at=started_at,
                     ended_at=time.time(),
@@ -540,6 +546,7 @@ class HeartflowPlugin(star.Star):
                     context=self.context,
                     umo=umo,
                     provider=judge_provider,
+                    source=MODEL_USAGE_SOURCE,
                     status="error",
                     started_at=started_at,
                     ended_at=time.time(),
@@ -552,6 +559,7 @@ class HeartflowPlugin(star.Star):
                 context=self.context,
                 umo=umo,
                 provider=judge_provider,
+                source=MODEL_USAGE_SOURCE,
                 response=llm_response,
                 status="completed",
                 started_at=started_at,

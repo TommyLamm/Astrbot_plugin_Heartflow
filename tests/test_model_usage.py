@@ -40,6 +40,7 @@ async def test_text_chat_records_each_json_attempt(plugin_factory, monkeypatch):
     assert result == {"relevance": 8}
     assert [call["status"] for call in calls] == ["completed", "completed"]
     assert all(call["response"] for call in calls)
+    assert all(call["source"] == "heartflow" for call in calls)
 
 
 @pytest.mark.anyio
